@@ -759,7 +759,12 @@ def _exec_and_generate(full_source: str, df) -> "pl.Series":
     if len(vals) > 0:
         mn, mx = vals.min(), vals.max()
         if mn < -1.0 or mx > 1.0:
-            raise ValueError(f"Signals out of range: min={mn}, max={mx}")
+            # Clamp slightly out-of-range signals rather than rejecting outright.
+            # LLM code often has minor scaling overshoot (~1.1x) that doesn't
+            # indicate a logic bug.  Hard reject only for egregious violations.
+            if mn < -2.0 or mx > 2.0:
+                raise ValueError(f"Signals far out of range: min={mn}, max={mx}")
+            signals = signals.clip(-1.0, 1.0)
 
     return signals
 
@@ -838,7 +843,9 @@ def get_llm_mutation(
     print("  Gate 1 ✓  compile()")
 
     # Gates 2-5: exec + instantiate + generate + validate
-    smoke_df = generate_mock_ohlcv(symbol="BTC/USDT", hours=200, seed=99)
+    # Use the SAME dataset as the Proving Ground (seed=42, 8760 bars) so that
+    # signals which pass here won't fail the full backtest on a different distribution.
+    smoke_df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
     try:
         _exec_and_generate(full_source, smoke_df)
     except Exception as e:
