@@ -40,6 +40,10 @@ data/
 # Bridge runtime logs
 logs/
 
+# meta_loop.py runtime artifacts
+bridge_override.json
+strategies/*.py.bak
+
 # OS
 .DS_Store
 Thumbs.db
