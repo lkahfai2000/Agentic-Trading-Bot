@@ -1058,6 +1058,21 @@ class TradingBridge:
 # ---------------------------------------------------------------------------
 
 
+def _apply_config_overrides(cfg: BridgeConfig) -> None:
+    """Load friction parameter overrides written by meta_loop.py, if present."""
+    override_path = Path("bridge_override.json")
+    if not override_path.exists():
+        return
+    try:
+        data = json.loads(override_path.read_text())
+        for key, val in data.get("overrides", {}).items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, type(getattr(cfg, key))(val))
+                print(f"[CONFIG OVERRIDE] {key} = {getattr(cfg, key)}", file=sys.stderr)
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"[CONFIG OVERRIDE] bridge_override.json error (ignored): {e}", file=sys.stderr)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -1122,6 +1137,8 @@ def main() -> None:
         log_level=args.log_level,
         dry_run=args.dry_run,
     )
+
+    _apply_config_overrides(config)
 
     client = BinanceTestnetClient(api_key, api_secret)
     bridge = TradingBridge(config, client)

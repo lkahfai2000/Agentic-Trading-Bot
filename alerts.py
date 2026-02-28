@@ -230,6 +230,35 @@ class TelegramAlerter:
         )
         self._send(text)
 
+    def mutation_accepted(
+        self,
+        mutation_name: str,
+        param_changes: dict,
+        old_cagr: float,
+        new_cagr: float,
+        old_sharpe: float,
+        new_sharpe: float,
+    ) -> None:
+        """Send a strategy mutation acceptance alert (called by meta_loop.py).
+
+        param_changes: {param_name: (old_val, new_val)}
+        """
+        changes_str = "\n".join(
+            f"  <code>{k}</code>: {old} \u2192 {new}"
+            for k, (old, new) in param_changes.items()
+        )
+        improvement_pct = (new_sharpe / old_sharpe - 1) * 100 if old_sharpe else 0.0
+        text = (
+            f"\U0001f680 <b>STRATEGY MUTATION ACCEPTED</b>\n\n"
+            f"<b>Mutation:</b> <code>{mutation_name}</code>\n\n"
+            f"<b>Parameter Changes:</b>\n{changes_str}\n\n"
+            f"<b>CAGR:</b>   <code>{old_cagr*100:+.1f}%</code> \u2192 <code>{new_cagr*100:+.1f}%</code>\n"
+            f"<b>Sharpe:</b> <code>{old_sharpe:+.4f}</code> \u2192 <code>{new_sharpe:+.4f}</code> "
+            f"(<code>+{improvement_pct:.1f}%</code>)\n\n"
+            f"\u267b\ufe0f <code>strategies/volatility_squeeze.py</code> updated."
+        )
+        self._send(text)
+
     def startup(self, mode: str, symbol: str, exposure: float) -> None:
         """Send a startup notification."""
         text = (
