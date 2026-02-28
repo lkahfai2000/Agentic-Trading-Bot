@@ -1,34 +1,34 @@
-"""Paper-trading bridge: V3 Convex Strategy -> Binance Testnet via CCXT.
+"""Paper-trading bridge: 1h Signal / 15m Execution Hybrid Model on Binance Testnet.
 
 Architecture
 ============
-The bridge is intentionally STATELESS. On every 1h cycle it:
+The bridge runs a 1h/15m hybrid execution model:
 
-  1. Fetches the most recent OHLCV candles from Binance Testnet.
-  2. Runs VolatilitySqueezeBreakout.generate_signals() to get the current
-     target signal in [-1.0, 1.0].
-  3. Queries the live wallet balance to derive the current position.
-  4. Computes the trade delta (target minus current) and size-checks against
-     max_account_exposure.
-  5. Places a limit order and watches it for up to cancel_after_seconds.
-     If unfilled, cancels and retries once with an aggressive price; otherwise
-     waits for the next 1h cycle.
-  6. Logs every decision in Dual-Track format: "Theoretical Signal" record
-     alongside "Attempted Order" record with exact exchange error codes.
+  1h Signal Layer (every epoch-hour boundary):
+     Fetches 1100 x 1h OHLCV candles and runs VolatilitySqueezeBreakout.generate_signals()
+     to compute the directional signal in [-1.0, 1.0]. The signal is stored in a
+     PersistenceWindow with 4 execution opportunities (one per 15m slot).
+
+  15m Sniper Layer (every epoch-15min boundary):
+     Fetches 100 x 15m OHLCV candles and checks whether the current 15m close is on
+     the correct side of the 15m EMA(21) — the "sniper confirmation" gate.
+     Only confirmed signals result in a limit order. The persistence window
+     counts down 4→0; at 0 the signal expires until the next 1h bar.
+
+  Execution (OrderManager):
+     Passive limit → Cancel-After-X timeout → Aggressive retry at mid ± slippage.
+
+  Dual-Track JSONL logging:
+     THEORETICAL records now include sniper_confirmed, ema_15m, persistence_remaining.
+     ATTEMPTED records are unchanged.
 
 No position state is stored in memory. The wallet IS the state.
 
 Usage
 =====
-    # Set environment variables:
-    #   BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET
-    python bridge.py
-
-    # Override defaults:
+    python bridge.py                                    # live hybrid mode
     python bridge.py --symbol BTC/USDT --max-exposure 0.5 --log-dir ./logs
-
-    # Dry-run (log signals only, no orders placed):
-    python bridge.py --dry-run
+    python bridge.py --dry-run                          # log THEORETICAL only
 """
 
 from __future__ import annotations
@@ -66,11 +66,18 @@ class BridgeConfig:
     symbol: str = "BTC/USDT"
     base_asset: str = "BTC"
     quote_asset: str = "USDT"
-    timeframe: str = "1h"
 
+    # 1h signal timeframe
+    timeframe: str = "1h"
     # Candle lookback — needs warmup for EMA (bear_ema_span=800)
     # + squeeze_lookback(240) + ATR warmup buffer
     candle_lookback: int = 1100
+
+    # 15m sniper timeframe
+    timeframe_15m: str = "15m"
+    candle_lookback_15m: int = 100  # 25h of 15m data; sufficient for EMA(21) warmup
+    ema_15m_period: int = 21        # 15m EMA period for sniper confirmation (~5.25h)
+    persistence_cycles: int = 4     # max 15m execution windows per 1h signal
 
     # Risk
     max_account_exposure: float = 0.95  # max fraction of USDT balance to risk
@@ -83,7 +90,7 @@ class BridgeConfig:
 
     # Health check
     max_consecutive_failures: int = 3  # failures before System Pause
-    cycle_interval_seconds: int = 3600  # 1h candle interval
+    cycle_interval_seconds: int = 900  # 15m execution cycle (was 3600)
     health_poll_interval: int = 60  # sub-cycle health poll (seconds)
 
     # Regime detection params (must match strategy exactly)
@@ -144,9 +151,10 @@ class DualTrackLogger:
         self._cycle_id: Optional[str] = None
 
     def new_cycle(self, ts: datetime) -> str:
-        """Start a new logging cycle. Returns the cycle_id."""
+        """Start a new logging cycle aligned to 15m boundaries. Returns cycle_id."""
+        aligned_min = (ts.minute // 15) * 15
         self._cycle_id = ts.replace(
-            minute=0, second=0, microsecond=0
+            minute=aligned_min, second=0, microsecond=0
         ).isoformat()
         self._console.info(f"{'─' * 20} Cycle {self._cycle_id} {'─' * 20}")
         return self._cycle_id
@@ -166,6 +174,9 @@ class DualTrackLogger:
         bear_regime: bool,
         cb_active: bool,
         max_usdt_allowed: float,
+        sniper_confirmed: bool = False,
+        ema_15m: float = 0.0,
+        persistence_remaining: int = 0,
     ) -> None:
         record = {
             "track": "THEORETICAL",
@@ -179,14 +190,20 @@ class DualTrackLogger:
             "bear_regime": bear_regime,
             "cb_active": cb_active,
             "max_usdt_allowed": round(max_usdt_allowed, 2),
+            # 1h/15m hybrid fields
+            "sniper_confirmed": sniper_confirmed,
+            "ema_15m": round(ema_15m, 2),
+            "persistence_remaining": persistence_remaining,
         }
         self._write(record)
         side = (
             "BUY" if delta_qty_btc > 0 else "SELL" if delta_qty_btc < 0 else "FLAT"
         )
+        sniper_tag = "SNIPER:OK" if sniper_confirmed else "SNIPER:WAIT"
         self._console.info(
             f"[THEORETICAL] signal={signal:+.4f} | delta={delta_qty_btc:+.6f} BTC "
-            f"({side}) | bear={bear_regime} cb={cb_active}"
+            f"({side}) | bear={bear_regime} cb={cb_active} | "
+            f"{sniper_tag} ema15m={ema_15m:.2f} persist={persistence_remaining}/4"
         )
 
     # -- ATTEMPTED track ----------------------------------------------------
@@ -352,6 +369,26 @@ class HealthMonitor:
     def reset(self) -> None:
         self._consecutive_failures = 0
         self._paused = False
+
+
+# ---------------------------------------------------------------------------
+# Persistence Window — 1h/15m Hybrid Signal State
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PersistenceWindow:
+    """Carries the 1h signal across up to 4 x 15m sniper execution windows.
+
+    Lifecycle:
+      - On each epoch-hour boundary: signal is refreshed, cycles_remaining reset to 4.
+      - On each epoch-15min boundary: cycles_remaining decremented after sniper check.
+      - When cycles_remaining reaches 0: no execution until the next 1h refresh.
+    """
+
+    signal: float = 0.0
+    epoch_hour: int = -1       # epoch-hour that last generated this signal
+    cycles_remaining: int = 0  # counts down 4→0 across 15m windows
 
 
 # ---------------------------------------------------------------------------
@@ -658,13 +695,17 @@ class OrderManager:
 
 
 class TradingBridge:
-    """Stateless 1h-cycle paper-trading bridge.
+    """1h-Signal / 15m-Execution hybrid paper-trading bridge.
 
-    On each cycle:
-      1. Fetch OHLCV -> run strategy -> extract current signal (last bar)
-      2. Query live balance -> derive current position
-      3. Size-check against max_account_exposure
-      4. Execute trade via OrderManager if delta > min_trade_notional
+    On each epoch-hour boundary:
+      1. Fetch 1h OHLCV -> run VolatilitySqueezeBreakout -> store signal in PersistenceWindow
+      2. Reset persistence window to 4 execution opportunities.
+
+    On each epoch-15min boundary (while cycles_remaining > 0):
+      1. Fetch 15m OHLCV -> compute 15m EMA(21) -> check sniper confirmation
+      2. If NOT confirmed: log THEORETICAL with sniper_confirmed=False, skip order
+      3. If confirmed: query balance, compute delta, execute via OrderManager
+      4. Decrement cycles_remaining
     """
 
     def __init__(
@@ -685,11 +726,13 @@ class TradingBridge:
             retry_slippage_bps=config.retry_slippage_bps,
             dry_run=config.dry_run,
         )
+        # 1h/15m hybrid state — signal persists across 4 x 15m sniper windows
+        self._persistence = PersistenceWindow()
 
     # -- Data fetching ------------------------------------------------------
 
     def _fetch_ohlcv_df(self) -> pl.DataFrame:
-        """Fetch OHLCV from exchange and return as Polars DataFrame."""
+        """Fetch 1h OHLCV from exchange and return as Polars DataFrame."""
         raw = self._client.fetch_ohlcv(
             self._cfg.symbol,
             self._cfg.timeframe,
@@ -706,6 +749,33 @@ class TradingBridge:
                 "close",
                 "volume",
             ],
+            orient="row",
+        )
+        return (
+            df.with_columns(
+                (pl.col("timestamp_ms") * 1_000)
+                .cast(pl.Datetime("us"))
+                .alias("timestamp"),
+                pl.col("open").cast(pl.Float64),
+                pl.col("high").cast(pl.Float64),
+                pl.col("low").cast(pl.Float64),
+                pl.col("close").cast(pl.Float64),
+                pl.col("volume").cast(pl.Float64),
+            )
+            .drop("timestamp_ms")
+            .sort("timestamp")
+        )
+
+    def _fetch_15m_ohlcv_df(self) -> pl.DataFrame:
+        """Fetch 15m OHLCV from exchange for sniper EMA computation."""
+        raw = self._client.fetch_ohlcv(
+            self._cfg.symbol,
+            self._cfg.timeframe_15m,
+            limit=self._cfg.candle_lookback_15m,
+        )
+        df = pl.DataFrame(
+            raw,
+            schema=["timestamp_ms", "open", "high", "low", "close", "volume"],
             orient="row",
         )
         return (
@@ -803,42 +873,96 @@ class TradingBridge:
 
         return target_btc, delta_btc
 
-    # -- Single cycle -------------------------------------------------------
+    # -- 1h signal layer -------------------------------------------------------
 
-    def _run_cycle(self) -> None:
-        """Execute one complete 1h cycle (fetch -> signal -> balance -> trade)."""
-        now = datetime.now(timezone.utc)
-        self._log.new_cycle(now)
+    def _run_1h_signal_cycle(self, epoch_hour: int) -> None:
+        """Fetch 1h OHLCV, run strategy, refresh the PersistenceWindow.
 
-        # Step 1: Fetch OHLCV
+        Called once per epoch-hour boundary. Updates self._persistence with
+        the new signal and resets cycles_remaining to persistence_cycles (4).
+        """
+        self._log.info(
+            f"[1H SIGNAL] Refreshing signal for epoch_hour={epoch_hour}"
+        )
+
+        # Fetch 1h OHLCV
         try:
-            df = self._fetch_ohlcv_df()
+            df_1h = self._fetch_ohlcv_df()
             self._health.record_success()
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
             count = self._health.record_failure()
             self._log.log_order_error(
                 type(e).__name__,
                 str(e),
-                {"action": "fetch_ohlcv", "consecutive_failures": count},
+                {"action": "fetch_ohlcv_1h", "consecutive_failures": count},
             )
             return
 
-        # Step 2: Run strategy — last signal = current bar signal
+        # Run strategy
         try:
-            signals = self._strategy.generate_signals(df)
+            signals = self._strategy.generate_signals(df_1h)
         except Exception as e:
-            self._log.log_system_event(
-                "STRATEGY_ERROR",
-                f"{type(e).__name__}: {e}",
+            self._log.log_system_event("STRATEGY_ERROR", f"{type(e).__name__}: {e}")
+            return
+
+        new_signal = float(signals[-1]) if len(signals) > 0 else 0.0
+
+        # Update persistence window
+        self._persistence.signal = new_signal
+        self._persistence.epoch_hour = epoch_hour
+        self._persistence.cycles_remaining = self._cfg.persistence_cycles
+
+        self._log.info(
+            f"[1H SIGNAL] signal={new_signal:+.4f} | "
+            f"persistence_cycles={self._cfg.persistence_cycles} (15m windows loaded)"
+        )
+
+    # -- 15m sniper layer ------------------------------------------------------
+
+    def _run_15m_sniper_cycle(self) -> None:
+        """15m sniper: confirm 1h signal via 15m EMA gate, then execute if confirmed.
+
+        Called every epoch-15min boundary while persistence.cycles_remaining > 0.
+        Decrements cycles_remaining after the sniper check regardless of outcome.
+        """
+        now = datetime.now(timezone.utc)
+        self._log.new_cycle(now)
+
+        signal = self._persistence.signal
+        remaining_before = self._persistence.cycles_remaining
+
+        # Step 1: Decrement persistence window (consume this 15m slot)
+        self._persistence.cycles_remaining -= 1
+        persistence_remaining = self._persistence.cycles_remaining
+
+        self._log.info(
+            f"[15M SNIPER] signal={signal:+.4f} | "
+            f"window={remaining_before}/4 → {persistence_remaining}/4"
+        )
+
+        # Step 2: Fetch 15m OHLCV for sniper EMA
+        try:
+            df_15m = self._fetch_15m_ohlcv_df()
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            self._log.log_order_error(
+                type(e).__name__, str(e), {"action": "fetch_ohlcv_15m"}
             )
             return
 
-        signal = float(signals[-1]) if len(signals) > 0 else 0.0
+        # Step 3: Sniper confirmation gate
+        sniper_confirmed, ema_15m = VolatilitySqueezeBreakout.get_15m_confirmation(
+            df_15m, signal, self._cfg.ema_15m_period
+        )
 
-        # Step 3: Compute regime context for dual-track logging
-        bear_regime, cb_active = self._compute_regime_flags(df)
+        # Step 4: Compute regime context for dual-track logging
+        try:
+            df_1h_cache = self._fetch_ohlcv_df()
+            bear_regime, cb_active = self._compute_regime_flags(df_1h_cache)
+        except (ccxt.NetworkError, ccxt.ExchangeError):
+            # Non-fatal: use safe defaults if 1h fetch fails during 15m check
+            bear_regime, cb_active = False, False
 
-        # Step 4: Fetch ticker for bid/ask
+        # Step 5: Fetch ticker for bid/ask
         try:
             ticker = self._client.fetch_ticker(self._cfg.symbol)
             bid = float(ticker["bid"])
@@ -850,7 +974,7 @@ class TradingBridge:
             )
             return
 
-        # Step 5: Balance check (stateless — query live wallet)
+        # Step 6: Balance check
         try:
             usdt_free, btc_held, max_usdt = self._query_position()
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
@@ -859,12 +983,12 @@ class TradingBridge:
             )
             return
 
-        # Step 6: Compute trade
+        # Step 7: Compute trade
         target_btc, delta_btc = self._compute_trade(
             signal, btc_held, max_usdt, current_price
         )
 
-        # Step 7: Log theoretical signal (BEFORE any order attempt)
+        # Step 8: Log THEORETICAL (always, sniper confirmed or not)
         self._log.log_theoretical(
             signal=signal,
             current_qty_btc=btc_held,
@@ -874,9 +998,12 @@ class TradingBridge:
             bear_regime=bear_regime,
             cb_active=cb_active,
             max_usdt_allowed=max_usdt,
+            sniper_confirmed=sniper_confirmed,
+            ema_15m=ema_15m,
+            persistence_remaining=persistence_remaining,
         )
 
-        # Telegram: trade signal + hourly PnL snapshot
+        # Telegram: trade signal snapshot
         self._alerts.trade_signal(
             signal=signal,
             delta_qty_btc=delta_btc,
@@ -884,7 +1011,25 @@ class TradingBridge:
             bear_regime=bear_regime,
             cb_active=cb_active,
             cycle_id=self._log._cycle_id,
+            sniper_confirmed=sniper_confirmed,
+            persistence_remaining=persistence_remaining,
+            ema_15m=ema_15m,
         )
+
+        # Step 9: Sniper gate — skip execution if not confirmed
+        if not sniper_confirmed:
+            self._log.info(
+                f"[SNIPER SKIP] 15m close {float(df_15m['close'][-1]):.2f} "
+                f"vs EMA(21) {ema_15m:.2f} — signal not confirmed, no order"
+            )
+            self._log.log_system_event(
+                "SNIPER_SKIP",
+                f"signal={signal:+.4f} close={float(df_15m['close'][-1]):.2f} "
+                f"ema15m={ema_15m:.2f} persist={persistence_remaining}",
+            )
+            return
+
+        # PnL snapshot only when executing (not on every 15m check)
         self._alerts.hourly_pnl(
             usdt_free=usdt_free,
             btc_total=btc_held,
@@ -892,7 +1037,7 @@ class TradingBridge:
             cycle_id=self._log._cycle_id,
         )
 
-        # Step 8: Is the trade worth executing?
+        # Step 10: Is the trade worth executing?
         delta_notional = abs(delta_btc) * current_price
         if delta_notional < self._cfg.min_trade_notional:
             self._log.info(
@@ -901,11 +1046,10 @@ class TradingBridge:
             )
             return
 
-        # Step 9: Execute via OrderManager
+        # Step 11: Execute via OrderManager
         side = "buy" if delta_btc > 0 else "sell"
         qty_to_trade = abs(delta_btc)
 
-        # Safety: if selling, never sell more than we hold
         if side == "sell":
             qty_to_trade = min(qty_to_trade, btc_held)
             if qty_to_trade < 1e-8:
@@ -988,18 +1132,23 @@ class TradingBridge:
     # -- Main loop ----------------------------------------------------------
 
     def run_forever(self) -> None:
-        """Main event loop.
+        """Main event loop — 1h Signal / 15m Execution hybrid.
 
-        Runs one full trading cycle per hour (on the epoch-hour boundary).
-        Runs a lightweight health check every 60 seconds between cycles.
-        3 consecutive health failures -> System Pause -> sys.exit(1).
+        Epoch-hour boundary  → regenerate 1h signal via VolatilitySqueezeBreakout,
+                               reset PersistenceWindow to 4 execution slots.
+        Epoch-15min boundary → run 15m sniper: check EMA confirmation, execute if
+                               confirmed and cycles_remaining > 0.
+        Every 60s            → lightweight health check (ticker ping).
+        3 consecutive fails  → System Pause → sys.exit(1).
         """
         mode = "DRY-RUN" if self._cfg.dry_run else "LIVE"
         self._log.log_system_event(
             "STARTUP",
             f"Bridge starting [{mode}] | symbol={self._cfg.symbol} "
             f"exposure={self._cfg.max_account_exposure:.0%} "
-            f"timeframe={self._cfg.timeframe}",
+            f"model=1h-Signal/15m-Exec "
+            f"ema15m_period={self._cfg.ema_15m_period} "
+            f"persistence_cycles={self._cfg.persistence_cycles}",
         )
         self._alerts.startup(
             mode=mode,
@@ -1011,12 +1160,12 @@ class TradingBridge:
         if not self._cfg.dry_run:
             self._cancel_stale_orders()
 
-        # epoch_hour avoids day-boundary ambiguity of datetime.hour
         last_epoch_hour = -1
+        last_epoch_15min = -1
 
         try:
             while True:
-                # Health check every iteration (every 60s)
+                # Health check every 60s (unchanged from V3)
                 self._run_health_check()
 
                 if self._health.is_paused():
@@ -1027,21 +1176,39 @@ class TradingBridge:
                         f"minutes). Exchange may be unreachable."
                     )
 
-                # Full trading cycle on epoch-hour boundary
-                epoch_hour = (
-                    int(datetime.now(timezone.utc).timestamp()) // 3600
-                )
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                epoch_hour = now_ts // 3600
+                epoch_15min = now_ts // 900  # 15m = 900s
+
+                # 1h boundary: refresh signal and load 4 persistence slots
                 if epoch_hour != last_epoch_hour:
                     try:
-                        self._run_cycle()
+                        self._run_1h_signal_cycle(epoch_hour)
                     except Exception as e:
-                        # Catch-all so the loop never dies unexpectedly
                         self._log.log_order_error(
                             "UNHANDLED_EXCEPTION",
                             str(e),
-                            {"type": type(e).__name__},
+                            {"type": type(e).__name__, "phase": "1h_signal"},
                         )
                     last_epoch_hour = epoch_hour
+
+                # 15m boundary: run sniper if persistence window is live
+                if epoch_15min != last_epoch_15min:
+                    if self._persistence.cycles_remaining > 0:
+                        try:
+                            self._run_15m_sniper_cycle()
+                        except Exception as e:
+                            self._log.log_order_error(
+                                "UNHANDLED_EXCEPTION",
+                                str(e),
+                                {"type": type(e).__name__, "phase": "15m_sniper"},
+                            )
+                    else:
+                        self._log.info(
+                            "[15M SNIPER] Persistence window exhausted — "
+                            "awaiting next 1h signal refresh"
+                        )
+                    last_epoch_15min = epoch_15min
 
                 time.sleep(self._cfg.health_poll_interval)
         finally:

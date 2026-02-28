@@ -226,6 +226,7 @@ class FailureStats:
     other_error_count: int
     narrative: str
     ranked_modes: list[str]
+    sniper_blocked_count: int = 0  # 15m sniper blocked non-zero signals
 
 
 @dataclass
@@ -286,6 +287,19 @@ _MUTATION_SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
         "REDUCE_WEAK_SIZING",
         "Weak-trend fills drag performance — raise ADX 25→28 and lower weak factor 0.5→0.35",
         {"adx_threshold": 28.0, "adx_weak_factor": 0.35},
+    ),
+    # 15m Sniper EMA tuning — triggered by sniper_blocked / sniper_overfit modes
+    (
+        "sniper_blocked",
+        "LOOSEN_EMA_SNIPER",
+        "15m EMA sniper blocks >50% of signals — loosen period 21→34 for less-reactive filter",
+        {"ema_15m_period": 34},
+    ),
+    (
+        "sniper_overfit",
+        "TIGHTEN_EMA_SNIPER",
+        "15m EMA sniper rarely blocks — tighten period 21→13 for more selective entry timing",
+        {"ema_15m_period": 13},
     ),
     # Pad A & B — always available as fallbacks
     (
@@ -472,6 +486,14 @@ def build_failure_stats(log_dir: str, lookback_hours: int = 24) -> FailureStats:
     cb_active_count = sum(1 for r in recent_theo if r.cb_active)
     bear_regime_count = sum(1 for r in recent_theo if r.bear_regime)
 
+    # 15m sniper blocked cycles: signal != 0 but sniper_confirmed == False
+    # Uses getattr for backward compat with pre-hybrid JSONL records
+    sniper_blocked_count = sum(
+        1 for r in recent_theo
+        if getattr(r, "signal", 0.0) != 0.0
+        and not getattr(r, "sniper_confirmed", True)
+    )
+
     # Count cancelled/placed orders (all time, since logs may be single-day)
     placed_count = len(parsed.orders_placed)
     cancelled_count = len(parsed.orders_cancelled)
@@ -487,12 +509,14 @@ def build_failure_stats(log_dir: str, lookback_hours: int = 24) -> FailureStats:
     ranked = _rank_failure_modes(
         total_cycles, cb_active_count, bear_regime_count,
         cancelled_count, placed_count, network_errors, other_errors,
+        sniper_blocked_count=sniper_blocked_count,
     )
 
     # Build narrative
     narrative = _build_narrative(
         total_cycles, cb_active_count, bear_regime_count,
         cancelled_count, placed_count, network_errors, other_errors,
+        sniper_blocked_count=sniper_blocked_count,
     )
 
     return FailureStats(
@@ -505,6 +529,7 @@ def build_failure_stats(log_dir: str, lookback_hours: int = 24) -> FailureStats:
         other_error_count=other_errors,
         narrative=narrative,
         ranked_modes=ranked,
+        sniper_blocked_count=sniper_blocked_count,
     )
 
 
@@ -516,6 +541,7 @@ def _rank_failure_modes(
     placed_count: int,
     network_errors: int,
     other_errors: int,
+    sniper_blocked_count: int = 0,
 ) -> list[str]:
     """Rank failure modes by weighted severity. Returns mode keys in order."""
     denom = max(total_cycles, 1)
@@ -532,6 +558,16 @@ def _rank_failure_modes(
         scores["cancel_timeout"] = cancelled_count / cancel_denom
     if other_errors > 0:
         scores["order_errors"] = other_errors / denom
+
+    # 15m sniper blocks: weighted 1.5x because each block is a missed execution
+    if sniper_blocked_count > 0:
+        sniper_rate = sniper_blocked_count / denom
+        if sniper_rate > 0.5:
+            # Sniper blocking > 50% of signals → EMA is too tight, loosen it
+            scores["sniper_blocked"] = sniper_rate * 1.5
+        elif sniper_rate < 0.1 and total_cycles > 20:
+            # Sniper almost never blocks → EMA may be too loose, tighten it
+            scores["sniper_overfit"] = 0.05
 
     # Derive secondary modes from scores
     if scores.get("cancel_timeout", 0) > 0.2:
@@ -561,6 +597,7 @@ def _build_narrative(
     placed: int,
     net_errors: int,
     other_errors: int,
+    sniper_blocked_count: int = 0,
 ) -> str:
     parts: list[str] = []
 
@@ -587,6 +624,14 @@ def _build_narrative(
         parts.append(
             f"{pct:.0f}% of limit orders ({cancelled}/{placed}) were cancelled before fill "
             f"— current timeout may be too tight for order book depth."
+        )
+
+    if sniper_blocked_count > 0:
+        pct = sniper_blocked_count / max(total_cycles, 1) * 100
+        parts.append(
+            f"15m Sniper EMA(21) blocked {pct:.0f}% of active signals "
+            f"({sniper_blocked_count}/{total_cycles}) — 1h signal direction not confirmed "
+            f"by 15m price position. Consider loosening EMA period if alpha is being missed."
         )
 
     if net_errors > 0:
@@ -780,6 +825,12 @@ _LLM_SYSTEM_PROMPT = """\
 You are a quantitative strategy engineer specialising in Polars-based \
 vectorized trading signal generation for hourly BTC/USDT data.
 
+ARCHITECTURE CONTEXT — 1h Signal / 15m Execution Hybrid:
+The bot generates 1h directional signals from generate_signals() and executes \
+via a 15m sniper layer (bridge.py) that gates each trade on a 15m EMA(21) \
+confirmation. Your task is to improve the 1h signal logic ONLY. Do NOT \
+reference or modify the 15m EMA sniper — that is wired in the bridge, not here.
+
 HARD RULES — violating ANY of these invalidates your output:
 1. Use ONLY Polars (import polars as pl). NEVER pandas, numpy for-loops, \
    .apply(), or .map_elements().
@@ -805,12 +856,13 @@ HARD RULES — violating ANY of these invalidates your output:
 
 _LLM_USER_TEMPLATE = """\
 ## Current Audit Metrics
-- Mean slippage: {mean_slip:.2f} bps
+- Mean slippage: {mean_slip:.2f} bps (friction floor: 10.0 bps)
 - Median slippage: {median_slip:.2f} bps
 - P95 fill time: {p95_time:.1f}s
 - Mean fill time: {mean_time:.1f}s
 - Filled orders: {filled}    Cancelled: {cancelled}
 - Stuck orders (>60s): {stuck}
+- 15m Sniper blocks: {sniper_blocked} cycles with active 1h signal rejected by EMA(21) gate
 
 ## Failure Narrative (last 24h)
 {narrative}
@@ -1004,6 +1056,7 @@ def get_llm_mutation(
         filled=metrics.filled_count,
         cancelled=metrics.cancelled_count,
         stuck=metrics.stuck_count,
+        sniper_blocked=stats.sniper_blocked_count,
         narrative=stats.narrative,
         method_source=method_source,
     )

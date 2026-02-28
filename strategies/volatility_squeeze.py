@@ -444,3 +444,36 @@ class VolatilitySqueezeBreakout(Strategy):
         )
 
         return result["signal"]
+
+    @staticmethod
+    def get_15m_confirmation(
+        df_15m: pl.DataFrame, signal: float, ema_period: int = 21
+    ) -> tuple[bool, float]:
+        """15m Sniper confirmation gate for the 1h/15m hybrid execution model.
+
+        Checks whether the current 15m price is on the correct side of the
+        15m EMA(21) to confirm the 1h directional signal before executing.
+
+        Rules:
+          Long  signal (> 0): confirmed when 15m close > EMA  (momentum up)
+          Short signal (< 0): confirmed when 15m close < EMA  (momentum down)
+          Flat  signal (= 0): always False — no position to take
+
+        Args:
+            df_15m:     Polars DataFrame with at least a 'close' column
+                        (15m OHLCV, minimum ema_period bars for warmup).
+            signal:     The scalar 1h signal value from generate_signals()[-1].
+            ema_period: EMA lookback in 15m bars (default 21 = ~5.25h).
+
+        Returns:
+            (confirmed: bool, ema_val: float)
+        """
+        ema = df_15m["close"].ewm_mean(com=ema_period - 1, adjust=False)
+        ema_val = float(ema[-1])
+        last_close = float(df_15m["close"][-1])
+
+        if signal > 0:
+            return last_close > ema_val, ema_val
+        elif signal < 0:
+            return last_close < ema_val, ema_val
+        return False, ema_val

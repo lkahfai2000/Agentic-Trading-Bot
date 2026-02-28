@@ -106,8 +106,11 @@ class TelegramAlerter:
         bear_regime: bool,
         cb_active: bool,
         cycle_id: Optional[str] = None,
+        sniper_confirmed: bool = False,
+        persistence_remaining: int = 0,
+        ema_15m: float = 0.0,
     ) -> None:
-        """Send a trade signal alert (THEORETICAL track)."""
+        """Send a trade signal alert (THEORETICAL track, 1h/15m hybrid)."""
         if delta_qty_btc > 0:
             icon, direction = "\U0001f7e2", "BUY"
         elif delta_qty_btc < 0:
@@ -117,6 +120,11 @@ class TelegramAlerter:
 
         regime = "\U0001f43b Bear" if bear_regime else "\U0001f402 Bull"
         cb = "\u26a0\ufe0f ON" if cb_active else "\u2705 OFF"
+        sniper = (
+            f"\u2705 CONFIRMED ({persistence_remaining} left)"
+            if sniper_confirmed
+            else "\u23f8\ufe0f WAITING"
+        )
 
         text = (
             f"{icon} <b>{direction} Signal</b>\n"
@@ -124,6 +132,8 @@ class TelegramAlerter:
             f"Delta: <code>{delta_qty_btc:+.6f} BTC</code>\n"
             f"Price: <code>${current_price_usd:,.2f}</code>\n"
             f"Regime: {regime} | CB: {cb}\n"
+            f"Sniper: {sniper}\n"
+            f"15m EMA: <code>${ema_15m:,.2f}</code>\n"
             f"Cycle: <code>{cycle_id or 'N/A'}</code>"
         )
         self._send(text)
@@ -260,10 +270,11 @@ class TelegramAlerter:
         self._send(text)
 
     def startup(self, mode: str, symbol: str, exposure: float) -> None:
-        """Send a startup notification."""
+        """Send a startup notification (1h Signal / 15m Execution hybrid)."""
         text = (
             f"\U0001f680 <b>Bridge Started [{mode}]</b>\n"
             f"Symbol: <code>{symbol}</code>\n"
+            f"Model: <code>1h Signal / 15m Execution</code>\n"
             f"Exposure: <code>{exposure:.0%}</code>\n"
             f"Time: <code>"
             f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"

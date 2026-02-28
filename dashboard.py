@@ -194,15 +194,22 @@ def _live_equity_series(records: list[dict]) -> tuple[list[str], list[float]]:
 
 
 def _regime_series(records: list[dict], days: int = REGIME_LOOKBACK_DAYS) -> list[dict]:
-    """Return list of {ts, bear_regime, cb_active} for last *days* days."""
+    """Return list of {ts, bear_regime, cb_active, sniper_confirmed, persistence_remaining}
+    for last *days* days."""
     cutoff = datetime.now(UTC) - timedelta(days=days)
     out = []
     for r in _theoretical_records(records):
         try:
             ts = datetime.fromisoformat(r["ts"])
             if ts >= cutoff:
-                out.append({"ts": ts, "bear_regime": r.get("bear_regime", False),
-                            "cb_active": r.get("cb_active", False)})
+                out.append({
+                    "ts": ts,
+                    "bear_regime": r.get("bear_regime", False),
+                    "cb_active": r.get("cb_active", False),
+                    "sniper_confirmed": r.get("sniper_confirmed", False),
+                    "persistence_remaining": r.get("persistence_remaining", 0),
+                    "ema_15m": r.get("ema_15m", 0.0),
+                })
         except Exception:
             pass
     return sorted(out, key=lambda x: x["ts"])
@@ -246,7 +253,7 @@ def render_kpi_row(
     audit_rows: list[Any],
     records: list[dict],
 ) -> None:
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     # KPI 1 — Live portfolio value
     live_value = live_vals[-1] if live_vals else None
@@ -260,9 +267,6 @@ def render_kpi_row(
     with col2:
         if live_ts and bt_ts and live_vals and bt_vals:
             try:
-                # Align: find bt equity at the same start as live
-                first_live_ts = datetime.fromisoformat(live_ts[0])
-                # Scale bt_vals so its t=0 matches live start value
                 init_live = live_vals[0]
                 init_bt = bt_vals[0]
                 scale = init_live / init_bt if init_bt != 0 else 1.0
@@ -307,6 +311,26 @@ def render_kpi_row(
             )
         else:
             st.metric("Active Regime", "—")
+
+    # KPI 5 — 15m Sniper status
+    with col5:
+        theo_list = _theoretical_records(records)
+        if theo_list:
+            last = sorted(theo_list, key=lambda r: r["ts"])[-1]
+            confirmed = last.get("sniper_confirmed", False)
+            persist = last.get("persistence_remaining", 0)
+            ema_val = last.get("ema_15m", 0.0)
+            sniper_color = "#27ae60" if confirmed else "#e67e22"
+            sniper_label = "CONFIRMED" if confirmed else "WAITING"
+            st.markdown(
+                f"**15m Sniper**  \n"
+                f'<span style="font-size:1.4rem;font-weight:700;color:{sniper_color}">'
+                f"{sniper_label}</span>  \n"
+                f"<small>{persist}/4 slots · EMA ${ema_val:,.0f}</small>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.metric("15m Sniper", "—")
 
 
 def render_equity_tab(
@@ -565,22 +589,39 @@ def render_regime_tab(records: list[dict]) -> None:
         colors.append(COLOR_MAP[regime])
         labels.append(regime)
 
+    sniper_flags = [row.get("sniper_confirmed", False) for row in regime_data]
+
     fig = go.Figure()
     for regime, color in COLOR_MAP.items():
         mask = [i for i, l in enumerate(labels) if l == regime]
         if not mask:
             continue
+        # Symbol: square-open for sniper-blocked, square for confirmed/no-signal
+        symbols = [
+            "square" if sniper_flags[i] or labels[i] == "Bull" and xs[i] == ""
+            else "square-open"
+            for i in mask
+        ]
         fig.add_trace(go.Scatter(
             x=[xs[i] for i in mask],
             y=[ys[i] for i in mask],
             mode="markers",
-            marker=dict(symbol="square", size=10, color=color),
+            marker=dict(
+                symbol=["square" if sniper_flags[i] else "square-open" for i in mask],
+                size=10,
+                color=color,
+                line=dict(width=2, color=color),
+            ),
             name=regime,
-            hovertemplate=f"<b>{regime}</b><br>%{{y}} %{{x}}<extra></extra>",
+            hovertemplate=(
+                f"<b>{regime}</b><br>%{{y}} %{{x}}<br>"
+                "Sniper: %{customdata}<extra></extra>"
+            ),
+            customdata=["OK" if sniper_flags[i] else "WAIT" for i in mask],
         ))
 
     fig.update_layout(
-        title=f"Regime Heatmap — Last {REGIME_LOOKBACK_DAYS} Days",
+        title=f"Regime Heatmap — Last {REGIME_LOOKBACK_DAYS} Days (filled=sniper OK, open=WAIT)",
         xaxis=dict(title="Hour (UTC)", tickangle=-45, categoryorder="category ascending"),
         yaxis=dict(title="Date", autorange="reversed"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -600,7 +641,7 @@ def render_regime_tab(records: list[dict]) -> None:
     c3.metric("Circuit Break", f"{counts.get('Circuit Break', 0) / total * 100:.0f}%")
 
     # Longest CB streak
-    cb_streak, max_cb_streak, current = 0, 0, False
+    cb_streak, max_cb_streak = 0, 0
     for label in labels:
         if label == "Circuit Break":
             cb_streak += 1
@@ -609,6 +650,21 @@ def render_regime_tab(records: list[dict]) -> None:
             cb_streak = 0
     if max_cb_streak:
         st.caption(f"Longest consecutive Circuit Break streak: **{max_cb_streak}h**")
+
+    # ── 15m Sniper confirmation summary ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**15m Sniper Confirmation Rate**")
+    active_signals = [i for i, row in enumerate(regime_data) if row.get("sniper_confirmed") is not None]
+    if active_signals:
+        confirmed_count = sum(1 for i in active_signals if sniper_flags[i])
+        blocked_count = len(active_signals) - confirmed_count
+        hit_rate = confirmed_count / len(active_signals) * 100 if active_signals else 0.0
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Sniper Confirmed", confirmed_count, f"{hit_rate:.0f}% hit rate")
+        sc2.metric("Sniper Blocked", blocked_count, f"{100 - hit_rate:.0f}% miss rate")
+        sc3.metric("Total 15m Checks", len(active_signals))
+    else:
+        st.caption("No 15m sniper data yet — bridge logs will populate this once running.")
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +702,7 @@ def main() -> None:
 
     # ── Header ───────────────────────────────────────────────────────────────
     st.markdown("# 📡 Command & Control Center")
-    st.caption("Agentic Trading Bot · Binance Testnet · BTC/USDT 1h")
+    st.caption("Agentic Trading Bot · Binance Testnet · BTC/USDT · 1h Signal / 15m Execution")
 
     # ── KPI row ──────────────────────────────────────────────────────────────
     render_kpi_row(live_ts, live_vals, bt_ts, bt_vals, audit_rows, records)
