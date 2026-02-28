@@ -53,6 +53,17 @@ V3 Design (Dynamic Regime Switching):
        Exits the "blast zone" before slippage becomes terminal. Applied as a
        post-signal override (Phase 15) after all other logic completes.
 
+V4 Design (Multi-Timeframe Sniper Entry):
+    One entry-timing overlay using 15m data:
+
+    7. SNIPER ENTRY FILTER (Phase 8B):
+       When 15m OHLCV is provided (df_fast), gate all 1h squeeze-release
+       entries with a 15m EMA crossover confirmation. A bull entry requires
+       the 15m fast EMA (8 bars ≈ 2h) to cross above the slow EMA (32 bars
+       ≈ 8h) within that same hour. This filters false breakouts where
+       intra-hour price action does not confirm the 1h signal direction.
+       When df_fast is None, the filter is skipped (backward compatible).
+
 Measured Impact (seed=42):
     V1 → V2: CAGR +11.2% → +16.5%, DD -31.5% → -26.1%, Sharpe 0.46 → 0.64
     V2 → V3: CAGR +16.5% → +23.5%, DD -26.1% → -15.0%, Sharpe 0.64 → 1.14
@@ -94,6 +105,9 @@ class VolatilitySqueezeBreakout(Strategy):
         bear_stop_factor: float = 1.0,
         cb_atr_mult: float = 3.0,
         cb_atr_lookback: int = 168,
+        # Multi-timeframe Sniper entry filter (V4)
+        sniper_ema_fast: int = 8,
+        sniper_ema_slow: int = 32,
     ):
         self.bb_period = bb_period
         self.bb_std = bb_std
@@ -113,8 +127,10 @@ class VolatilitySqueezeBreakout(Strategy):
         self.bear_stop_factor = bear_stop_factor
         self.cb_atr_mult = cb_atr_mult
         self.cb_atr_lookback = cb_atr_lookback
+        self.sniper_ema_fast = sniper_ema_fast
+        self.sniper_ema_slow = sniper_ema_slow
 
-    def generate_signals(self, df: pl.DataFrame) -> pl.Series:
+    def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:
         # =====================================================================
         # Phases 1-8: Core indicators (unchanged from V1)
         # =====================================================================
@@ -252,6 +268,80 @@ class VolatilitySqueezeBreakout(Strategy):
                 & (pl.col("candle_position") < self.candle_body_threshold)
             ).alias("short_entry"),
         ])
+
+        # Phase 8B: Multi-Timeframe Sniper Entry Filter (V4)
+        # Gate 1h entries using 15m EMA crossover confirmation.
+        # For each 1h bar, check if within that hour the 15m fast EMA
+        # crossed above (bull) or below (bear) the slow EMA.
+        # When df_fast is None, this phase is skipped entirely (backward
+        # compatible with single-timeframe operation).
+        if df_fast is not None:
+            fast_ind = df_fast.with_columns([
+                pl.col("close")
+                .ewm_mean(span=self.sniper_ema_fast, adjust=False)
+                .alias("ema_fast_15m"),
+                pl.col("close")
+                .ewm_mean(span=self.sniper_ema_slow, adjust=False)
+                .alias("ema_slow_15m"),
+            ])
+
+            # Detect cross events (was below → now above, and vice versa)
+            fast_ind = fast_ind.with_columns([
+                (
+                    (pl.col("ema_fast_15m") > pl.col("ema_slow_15m"))
+                    & (
+                        pl.col("ema_fast_15m").shift(1)
+                        <= pl.col("ema_slow_15m").shift(1)
+                    )
+                )
+                .fill_null(False)
+                .alias("bull_cross_15m"),
+                (
+                    (pl.col("ema_fast_15m") < pl.col("ema_slow_15m"))
+                    & (
+                        pl.col("ema_fast_15m").shift(1)
+                        >= pl.col("ema_slow_15m").shift(1)
+                    )
+                )
+                .fill_null(False)
+                .alias("bear_cross_15m"),
+            ])
+
+            # Truncate 15m timestamps to their containing 1h boundary
+            fast_ind = fast_ind.with_columns(
+                pl.col("timestamp").dt.truncate("1h").alias("hour_ts")
+            )
+
+            # Aggregate: did ANY 15m bar in this hour have a cross?
+            hourly_confirm = (
+                fast_ind.group_by("hour_ts")
+                .agg([
+                    pl.col("bull_cross_15m").any().alias("bull_confirmed"),
+                    pl.col("bear_cross_15m").any().alias("bear_confirmed"),
+                ])
+                .sort("hour_ts")
+            )
+
+            # Join confirmation flags back to the 1h indicator DataFrame
+            ind = ind.join(
+                hourly_confirm,
+                left_on="timestamp",
+                right_on="hour_ts",
+                how="left",
+            ).with_columns([
+                pl.col("bull_confirmed").fill_null(False),
+                pl.col("bear_confirmed").fill_null(False),
+            ])
+
+            # Gate entries: 1h entry requires 15m cross confirmation
+            ind = ind.with_columns([
+                (pl.col("long_entry") & pl.col("bull_confirmed")).alias(
+                    "long_entry"
+                ),
+                (pl.col("short_entry") & pl.col("bear_confirmed")).alias(
+                    "short_entry"
+                ),
+            ])
 
         # =====================================================================
         # Phases 9-14: Convex Alpha Generator (NEW in V2)

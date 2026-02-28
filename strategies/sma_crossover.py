@@ -16,7 +16,7 @@ class SmaCrossover(Strategy):
         self.fast = fast
         self.slow = slow
 
-    def generate_signals(self, df: pl.DataFrame) -> pl.Series:
+    def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:
         result = df.select(
             pl.when(
                 pl.col("close").rolling_mean(self.fast)

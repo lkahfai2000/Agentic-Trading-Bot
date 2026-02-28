@@ -67,10 +67,12 @@ class BridgeConfig:
     base_asset: str = "BTC"
     quote_asset: str = "USDT"
     timeframe: str = "1h"
+    timeframe_fast: str = "15m"  # fast timeframe for Sniper entry filter
 
     # Candle lookback — needs warmup for EMA (bear_ema_span=800)
     # + squeeze_lookback(240) + ATR warmup buffer
     candle_lookback: int = 1100
+    candle_lookback_fast: int = 100  # 100 × 15m bars ≈ 25 hours
 
     # Risk
     max_account_exposure: float = 0.95  # max fraction of USDT balance to risk
@@ -688,12 +690,21 @@ class TradingBridge:
 
     # -- Data fetching ------------------------------------------------------
 
-    def _fetch_ohlcv_df(self) -> pl.DataFrame:
-        """Fetch OHLCV from exchange and return as Polars DataFrame."""
+    def _fetch_ohlcv_df(
+        self,
+        timeframe: str | None = None,
+        limit: int | None = None,
+    ) -> pl.DataFrame:
+        """Fetch OHLCV from exchange and return as Polars DataFrame.
+
+        Args:
+            timeframe: Override config timeframe (e.g. "15m" for fast data).
+            limit: Override config candle_lookback.
+        """
         raw = self._client.fetch_ohlcv(
             self._cfg.symbol,
-            self._cfg.timeframe,
-            limit=self._cfg.candle_lookback,
+            timeframe or self._cfg.timeframe,
+            limit=limit or self._cfg.candle_lookback,
         )
         # CCXT format: [[timestamp_ms, open, high, low, close, volume], ...]
         df = pl.DataFrame(
@@ -810,7 +821,7 @@ class TradingBridge:
         now = datetime.now(timezone.utc)
         self._log.new_cycle(now)
 
-        # Step 1: Fetch OHLCV
+        # Step 1: Fetch OHLCV (both timeframes)
         try:
             df = self._fetch_ohlcv_df()
             self._health.record_success()
@@ -823,9 +834,22 @@ class TradingBridge:
             )
             return
 
+        # Step 1b: Fetch 15m data for Sniper confirmation (graceful degradation)
+        df_fast: pl.DataFrame | None = None
+        try:
+            df_fast = self._fetch_ohlcv_df(
+                timeframe=self._cfg.timeframe_fast,
+                limit=self._cfg.candle_lookback_fast,
+            )
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            self._log.log_system_event(
+                "FETCH_15M_DEGRADED",
+                f"{type(e).__name__}: {e} — falling back to single-timeframe",
+            )
+
         # Step 2: Run strategy — last signal = current bar signal
         try:
-            signals = self._strategy.generate_signals(df)
+            signals = self._strategy.generate_signals(df, df_fast=df_fast)
         except Exception as e:
             self._log.log_system_event(
                 "STRATEGY_ERROR",
@@ -999,7 +1023,7 @@ class TradingBridge:
             "STARTUP",
             f"Bridge starting [{mode}] | symbol={self._cfg.symbol} "
             f"exposure={self._cfg.max_account_exposure:.0%} "
-            f"timeframe={self._cfg.timeframe}",
+            f"timeframe={self._cfg.timeframe}+{self._cfg.timeframe_fast}",
         )
         self._alerts.startup(
             mode=mode,

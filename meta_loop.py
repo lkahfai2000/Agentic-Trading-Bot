@@ -50,7 +50,7 @@ from urllib.request import Request, urlopen
 # ---------------------------------------------------------------------------
 import audit as _audit  # import as module to avoid name collisions
 from alerts import TelegramAlerter
-from backtester.data import generate_mock_ohlcv
+from backtester.data import generate_mock_ohlcv, generate_mock_ohlcv_mtf
 from backtester.engine import run_backtest
 from backtester.schema import GradingReport
 from strategies.volatility_squeeze import VolatilitySqueezeBreakout
@@ -89,6 +89,8 @@ PARAM_SOURCE_STRINGS: dict[str, str] = {
     "bear_stop_factor": "1.0",
     "cb_atr_mult": "3.0",
     "cb_atr_lookback": "168",
+    "sniper_ema_fast": "8",
+    "sniper_ema_slow": "32",
 }
 
 # Canonical production defaults — used to build full_params for each mutation
@@ -111,6 +113,8 @@ BASELINE_PARAMS: dict[str, Any] = {
     "bear_stop_factor": 1.0,
     "cb_atr_mult": 3.0,
     "cb_atr_lookback": 168,
+    "sniper_ema_fast": 8,
+    "sniper_ema_slow": 32,
 }
 
 
@@ -286,6 +290,19 @@ _MUTATION_SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
         "REDUCE_WEAK_SIZING",
         "Weak-trend fills drag performance — raise ADX 25→28 and lower weak factor 0.5→0.35",
         {"adx_threshold": 28.0, "adx_weak_factor": 0.35},
+    ),
+    # MTF Sniper entry filter mutations
+    (
+        "high_slippage",
+        "TIGHTEN_SNIPER_EMA",
+        "High alpha leak — tighten 15m sniper slow EMA 32→20 for faster entry confirmation",
+        {"sniper_ema_slow": 20},
+    ),
+    (
+        "weak_trend",
+        "WIDEN_SNIPER_EMA",
+        "Weak-trend entries — widen 15m sniper slow EMA 32→48 to filter noise",
+        {"sniper_ema_slow": 48},
     ),
     # Pad A & B — always available as fallbacks
     (
@@ -778,22 +795,23 @@ def propose_mutations(
 
 _LLM_SYSTEM_PROMPT = """\
 You are a quantitative strategy engineer specialising in Polars-based \
-vectorized trading signal generation for hourly BTC/USDT data.
+vectorized trading signal generation for BTC/USDT data across multiple timeframes.
 
 HARD RULES — violating ANY of these invalidates your output:
 1. Use ONLY Polars (import polars as pl). NEVER pandas, numpy for-loops, \
    .apply(), or .map_elements().
 2. The method signature MUST be exactly:
-       def generate_signals(self, df: pl.DataFrame) -> pl.Series:
-3. df starts with: timestamp, open, high, low, close, volume (all Float64). \
+       def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:
+   df is 1h OHLCV data. df_fast is 15m OHLCV data (may be None).
+3. df and df_fast have: timestamp, open, high, low, close, volume (all Float64). \
    The method adds computed columns (bb_mid, bb_upper, bb_lower, bb_std_val, \
-   true_range, atr, bbw, atr_baseline, atr_spike_ratio, cb_active, \
-   mom_1h, mom_4h, bull_1h, bull_4h, bear_1h, bear_4h, etc.). \
+   true_range, atr, bbw, atr_baseline, atr_spike_ratio, cb_active, etc.). \
    If you reference a column, you MUST ensure it is computed in a prior phase.
-4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df. \
+4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df (the 1h frame). \
    Use .clip(-1.0, 1.0) on the final signal to guarantee this.
 5. Reference ONLY self.xxx attributes defined in the existing __init__. \
-   Do NOT add new constructor parameters.
+   Do NOT add new constructor parameters. Available MTF attributes: \
+   self.sniper_ema_fast (int), self.sniper_ema_slow (int).
 6. Preserve the existing 15-phase architecture. Add or modify phases — \
    do NOT delete existing phases unless replacing their purpose.
 7. Polars API gotchas: \
@@ -801,16 +819,29 @@ HARD RULES — violating ANY of these invalidates your output:
    - Use .ewm_mean() NOT .ewm().mean(). \
    - Use pl.col("x").rolling_mean(window_size=N) NOT .rolling(N).mean(). \
    - Use .shift(n) NOT .shift(periods=n).
+8. When using df_fast, aggregate 15m data to 1h using \
+   pl.col("timestamp").dt.truncate("1h") as group key before joining to \
+   the 1h indicator DataFrame. The output must be the same length as df.
 """
 
 _LLM_USER_TEMPLATE = """\
 ## Current Audit Metrics
-- Mean slippage: {mean_slip:.2f} bps
+- Mean slippage: {mean_slip:.2f} bps (alpha leak — target: reduce below 10 bps)
 - Median slippage: {median_slip:.2f} bps
 - P95 fill time: {p95_time:.1f}s
 - Mean fill time: {mean_time:.1f}s
 - Filled orders: {filled}    Cancelled: {cancelled}
 - Stuck orders (>60s): {stuck}
+
+## Multi-Timeframe Architecture
+The strategy uses two timeframes:
+- 1h (df): Trend direction, squeeze detection, regime classification
+- 15m (df_fast): Entry timing via EMA crossover confirmation (Sniper Rule)
+
+The current 15m entry filter (Phase 8B) uses a dual-EMA crossover gate: \
+fast EMA(8) crossing above/below slow EMA(32) on 15m data. This filters \
+1h entries that lack intra-hour price confirmation. Alpha leakage of \
+{mean_slip:.2f} bps suggests the 15m filter may need structural improvement.
 
 ## Failure Narrative (last 24h)
 {narrative}
@@ -822,13 +853,14 @@ _LLM_USER_TEMPLATE = """\
 
 ## Task
 Diagnose the primary failure mode visible in the metrics and narrative, \
-then propose ONE structural change to the signal logic. This must be a \
-logic shift, NOT a parameter tweak. Examples of valid structural changes:
-  - Add a volume-weighted confirmation filter to entry conditions
-  - Add a multi-timeframe trend confirmation (e.g. 4h trend from 1h bars)
-  - Add a volatility regime classifier that switches between strategies
-  - Replace the candle_body_threshold gate with a different momentum filter
-  - Add an order-flow imbalance proxy using volume delta
+then propose ONE structural change to the 15m entry filter logic (Phase 8B). \
+This must be a logic shift, NOT a parameter tweak. Examples of valid changes:
+  - Replace simple EMA cross with volume-weighted VWAP confirmation on 15m
+  - Add a 15m RSI divergence filter rejecting entries when momentum diverges
+  - Add a 15m ATR contraction gate that waits for volatility to compress
+  - Use 15m order-flow imbalance (buy vs sell volume) to confirm direction
+  - Add a 15m higher-high/higher-low structure confirmation for long entries
+  - Replace Phase 8B with a 15m Bollinger Band squeeze-within-squeeze filter
 
 ## Output Format (STRICT — follow exactly)
 DIAGNOSIS: <2-3 sentences explaining the primary failure mode>
@@ -836,7 +868,7 @@ DIAGNOSIS: <2-3 sentences explaining the primary failure mode>
 CHANGE: <1 sentence describing your structural change>
 
 ```python
-    def generate_signals(self, df: pl.DataFrame) -> pl.Series:
+    def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:
         <complete method body here>
 ```
 """
@@ -878,7 +910,7 @@ def _call_anthropic_api(
 
 def _extract_generate_signals(source: str) -> str:
     """Extract the generate_signals method from the strategy file."""
-    marker = "    def generate_signals(self, df: pl.DataFrame) -> pl.Series:"
+    marker = "    def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:"
     idx = source.find(marker)
     if idx == -1:
         raise ValueError("generate_signals not found in source")
@@ -919,7 +951,7 @@ def _splice_method(original_source: str, new_method: str) -> str:
     and replaces from 'def generate_signals' to EOF. This works because
     generate_signals is the LAST method in the class (lines 117-EOF).
     """
-    marker = "    def generate_signals(self, df: pl.DataFrame) -> pl.Series:"
+    marker = "    def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:"
     idx = original_source.find(marker)
     if idx == -1:
         raise ValueError("generate_signals not found in source — cannot splice")
@@ -927,7 +959,7 @@ def _splice_method(original_source: str, new_method: str) -> str:
     return prefix + new_method.rstrip() + "\n"
 
 
-def _exec_and_generate(full_source: str, df) -> "pl.Series":
+def _exec_and_generate(full_source: str, df, df_fast=None) -> "pl.Series":
     """Execute modified source via exec() and generate signals.
 
     The source includes its own imports (polars, Strategy ABC), so the
@@ -943,7 +975,7 @@ def _exec_and_generate(full_source: str, df) -> "pl.Series":
         raise RuntimeError("VolatilitySqueezeBreakout class not found in exec'd source")
 
     strategy = strategy_cls()
-    signals = strategy.generate_signals(df)
+    signals = strategy.generate_signals(df, df_fast=df_fast)
 
     # Validate signal contract
     if not isinstance(signals, pl.Series):
@@ -1048,11 +1080,11 @@ def get_llm_mutation(
     print("  Gate 1 ✓  compile()")
 
     # Gates 2-5: exec + instantiate + generate + validate
-    # Use the SAME dataset as the Proving Ground (seed=42, 8760 bars) so that
+    # Use MTF dataset matching the Proving Ground (seed=42, 8760 hours) so that
     # signals which pass here won't fail the full backtest on a different distribution.
-    smoke_df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
+    smoke_df, smoke_df_fast = generate_mock_ohlcv_mtf(symbol="BTC/USDT", hours=8760, seed=42)
     try:
-        _exec_and_generate(full_source, smoke_df)
+        _exec_and_generate(full_source, smoke_df, df_fast=smoke_df_fast)
     except Exception as e:
         print(f"  Gate 2-5 FAIL — exec/generate: {e}")
         return None
@@ -1074,10 +1106,10 @@ def _run_llm_backtest(
     friction_bps: float,
 ) -> Optional[MutationResult]:
     """Run the LLM mutation through the full Proving Ground backtest."""
-    df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
+    df, df_fast = generate_mock_ohlcv_mtf(symbol="BTC/USDT", hours=8760, seed=42)
 
     try:
-        signals = _exec_and_generate(candidate.llm_source, df)
+        signals = _exec_and_generate(candidate.llm_source, df, df_fast=df_fast)
     except Exception as e:
         print(f"  LLM backtest runtime error: {e}")
         return None
@@ -1124,13 +1156,13 @@ def run_proving_ground(
     baseline matches actual production.
     """
     base = current_params if current_params is not None else BASELINE_PARAMS
-    df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
+    df, df_fast = generate_mock_ohlcv_mtf(symbol="BTC/USDT", hours=8760, seed=42)
 
     # Baseline — use current production params, not hardcoded originals
     baseline_strategy = VolatilitySqueezeBreakout(**base)
     baseline_report = run_backtest(
         df=df,
-        signals=baseline_strategy.generate_signals(df),
+        signals=baseline_strategy.generate_signals(df, df_fast=df_fast),
         init_cash=10_000.0,
         fee_bps=10.0,
         slippage_bps=friction_bps,
@@ -1153,7 +1185,7 @@ def run_proving_ground(
         strategy = VolatilitySqueezeBreakout(**m.full_params)
         report = run_backtest(
             df=df,
-            signals=strategy.generate_signals(df),
+            signals=strategy.generate_signals(df, df_fast=df_fast),
             init_cash=10_000.0,
             fee_bps=10.0,
             slippage_bps=friction_bps,

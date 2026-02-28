@@ -4,27 +4,32 @@ Usage:
     python main.py                    # Run both strategies, compare
     python main.py sma                # Run SMA crossover only
     python main.py squeeze            # Run volatility squeeze only
+    python main.py mtf                # Run MTF squeeze (15m sniper filter)
+    python main.py walkforward        # Walk-forward validation
 """
 
 import json
 import sys
 import time
 
-from backtester.data import generate_mock_ohlcv
+from backtester.data import generate_mock_ohlcv, generate_mock_ohlcv_mtf
 from backtester.engine import run_backtest
 from backtester.strategy import Strategy
 from strategies.sma_crossover import SmaCrossover
 from strategies.volatility_squeeze import VolatilitySqueezeBreakout
+
+import polars as pl
 
 
 def run_strategy(
     strategy: Strategy,
     df,
     symbol: str = "BTC/USDT",
+    df_fast: pl.DataFrame | None = None,
 ) -> dict:
     """Run a single strategy through the Proving Ground and return results."""
     t0 = time.perf_counter()
-    signals = strategy.generate_signals(df)
+    signals = strategy.generate_signals(df, df_fast=df_fast)
     report = run_backtest(
         df=df,
         signals=signals,
@@ -88,6 +93,44 @@ def main() -> None:
     if target == "walkforward":
         results = run_walkforward(df)
         output = [r["report"].model_dump() for r in results]
+        print(json.dumps(output, indent=2))
+        return
+
+    if target == "mtf":
+        # Multi-timeframe comparison: squeeze without vs with 15m sniper filter
+        df_1h, df_15m = generate_mock_ohlcv_mtf(
+            symbol="BTC/USDT", hours=8760, seed=42
+        )
+        strategy = VolatilitySqueezeBreakout()
+
+        print("=== MTF Comparison (seed=42) ===", file=sys.stderr)
+
+        # Baseline: 1h only (no sniper filter)
+        r_1h = run_strategy(strategy, df_1h)
+        rep = r_1h["report"]
+        print(f"\n  [1h Only]:", file=sys.stderr)
+        print(f"    CAGR:     {rep.cagr*100:+.1f}%", file=sys.stderr)
+        print(f"    Max DD:   {rep.max_drawdown*100:.1f}%", file=sys.stderr)
+        print(f"    Sharpe:   {rep.sharpe_ratio:+.2f}", file=sys.stderr)
+        print(f"    Trades:   {rep.total_trades}", file=sys.stderr)
+        print(f"    Win Rate: {rep.win_rate:.0%}", file=sys.stderr)
+        print(f"    Time:     {r_1h['elapsed_ms']:.1f}ms", file=sys.stderr)
+
+        # MTF: 1h + 15m sniper filter
+        r_mtf = run_strategy(strategy, df_1h, df_fast=df_15m)
+        rep = r_mtf["report"]
+        print(f"\n  [1h + 15m Sniper]:", file=sys.stderr)
+        print(f"    CAGR:     {rep.cagr*100:+.1f}%", file=sys.stderr)
+        print(f"    Max DD:   {rep.max_drawdown*100:.1f}%", file=sys.stderr)
+        print(f"    Sharpe:   {rep.sharpe_ratio:+.2f}", file=sys.stderr)
+        print(f"    Trades:   {rep.total_trades}", file=sys.stderr)
+        print(f"    Win Rate: {rep.win_rate:.0%}", file=sys.stderr)
+        print(f"    Time:     {r_mtf['elapsed_ms']:.1f}ms", file=sys.stderr)
+
+        output = [
+            {**r_1h["report"].model_dump(), "strategy_name": "Squeeze_1h_Only"},
+            {**r_mtf["report"].model_dump(), "strategy_name": "Squeeze_1h+15m_Sniper"},
+        ]
         print(json.dumps(output, indent=2))
         return
 
