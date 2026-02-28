@@ -1293,6 +1293,12 @@ def main() -> None:
         traceback.print_exc()
         exit_code = 1
 
+    # Allow Telegram sender thread to flush queued messages before exit.
+    # TelegramAlerter uses a daemon thread — it dies with the process.
+    if exit_code == 2:
+        import time
+        time.sleep(3)
+
     print()
     print("=" * W)
     print(f"  Meta loop complete.  Exit code: {exit_code}")
