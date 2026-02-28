@@ -600,11 +600,17 @@ HARD RULES — violating ANY of these invalidates your output:
    true_range, atr, bbw, atr_baseline, atr_spike_ratio, cb_active, \
    mom_1h, mom_4h, bull_1h, bull_4h, bear_1h, bear_4h, etc.). \
    If you reference a column, you MUST ensure it is computed in a prior phase.
-4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df.
+4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df. \
+   Use .clip(-1.0, 1.0) on the final signal to guarantee this.
 5. Reference ONLY self.xxx attributes defined in the existing __init__. \
    Do NOT add new constructor parameters.
 6. Preserve the existing 15-phase architecture. Add or modify phases — \
    do NOT delete existing phases unless replacing their purpose.
+7. Polars API gotchas: \
+   - Natural log: use .log(base=math.e) or (col / col).log(), NOT .ln() (does not exist). \
+   - Use .ewm_mean() NOT .ewm().mean(). \
+   - Use pl.col("x").rolling_mean(window_size=N) NOT .rolling(N).mean(). \
+   - Use .shift(n) NOT .shift(periods=n).
 """
 
 _LLM_USER_TEMPLATE = """\
