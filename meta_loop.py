@@ -956,7 +956,7 @@ def _write_mutation_meta(
 ) -> None:
     """Persist hot-swap metadata to strategies/mutation_meta.json for the dashboard."""
     meta = {
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "mutation_name": best.candidate.name,
         "rationale": best.candidate.rationale,
         "is_llm": best.candidate.is_llm,
