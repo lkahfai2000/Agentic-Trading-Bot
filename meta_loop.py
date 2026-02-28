@@ -8,7 +8,8 @@ Pipeline:
   2. Update bridge_override.json if alpha leakage exceeds threshold
   3. Parse last 24h of JSONL logs → generate failure narrative
   4. Propose 3 parameter mutations targeted at the top failure modes
-  5. Run baseline + 3 mutations through the Proving Ground at 15bps friction
+  4b. (Optional) LLM Consultant proposes one structural code mutation
+  5. Run baseline + mutations through the Proving Ground at 15bps friction
   6. Hot-swap strategies/volatility_squeeze.py if best mutation wins by >10% Sharpe
 
 Usage:
@@ -16,6 +17,7 @@ Usage:
     python meta_loop.py --log-dir logs/     # explicit log directory
     python meta_loop.py --dry-run           # analyse only, no file writes
     python meta_loop.py --friction-bps 20  # override slippage floor
+    python meta_loop.py --enable-llm       # activate LLM structural mutation
 
 Cron example (daily at 06:00 UTC):
     0 6 * * * cd /home/user/Agentic-Trading-Bot && python meta_loop.py >> meta_loop.log 2>&1
@@ -30,14 +32,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median, quantiles
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # Internal project imports
@@ -141,6 +147,8 @@ class MutationCandidate:
     rationale: str
     param_changes: dict[str, Any]       # delta only — e.g. {"cb_atr_mult": 3.5}
     full_params: dict[str, Any]         # complete kwargs for strategy constructor
+    is_llm: bool = False                # True for LLM structural mutations
+    llm_source: Optional[str] = None    # full file source for LLM hot-swap
 
 
 @dataclass
@@ -523,6 +531,316 @@ def propose_mutations(stats: FailureStats) -> list[MutationCandidate]:
 
 
 # ===================================================================
+# Phase 4b: LLM Consultant (structural code mutation)
+# ===================================================================
+
+_LLM_SYSTEM_PROMPT = """\
+You are a quantitative strategy engineer specialising in Polars-based \
+vectorized trading signal generation for hourly BTC/USDT data.
+
+HARD RULES — violating ANY of these invalidates your output:
+1. Use ONLY Polars (import polars as pl). NEVER pandas, numpy for-loops, \
+   .apply(), or .map_elements().
+2. The method signature MUST be exactly:
+       def generate_signals(self, df: pl.DataFrame) -> pl.Series:
+3. df has columns: timestamp, open, high, low, close, volume (all Float64).
+4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df.
+5. Reference ONLY self.xxx attributes defined in the existing __init__. \
+   Do NOT add new constructor parameters.
+6. Preserve the existing 15-phase architecture. Add or modify phases — \
+   do NOT delete existing phases unless replacing their purpose.
+"""
+
+_LLM_USER_TEMPLATE = """\
+## Current Audit Metrics
+- Mean slippage: {mean_slip:.2f} bps
+- Median slippage: {median_slip:.2f} bps
+- P95 fill time: {p95_time:.1f}s
+- Mean fill time: {mean_time:.1f}s
+- Filled orders: {filled}    Cancelled: {cancelled}
+- Stuck orders (>60s): {stuck}
+
+## Failure Narrative (last 24h)
+{narrative}
+
+## Current generate_signals Method
+```python
+{method_source}
+```
+
+## Task
+Diagnose the primary failure mode visible in the metrics and narrative, \
+then propose ONE structural change to the signal logic. This must be a \
+logic shift, NOT a parameter tweak. Examples of valid structural changes:
+  - Add a volume-weighted confirmation filter to entry conditions
+  - Add a multi-timeframe trend confirmation (e.g. 4h trend from 1h bars)
+  - Add a volatility regime classifier that switches between strategies
+  - Replace the candle_body_threshold gate with a different momentum filter
+  - Add an order-flow imbalance proxy using volume delta
+
+## Output Format (STRICT — follow exactly)
+DIAGNOSIS: <2-3 sentences explaining the primary failure mode>
+
+CHANGE: <1 sentence describing your structural change>
+
+```python
+    def generate_signals(self, df: pl.DataFrame) -> pl.Series:
+        <complete method body here>
+```
+"""
+
+
+def _call_anthropic_api(
+    api_key: str,
+    system: str,
+    user_prompt: str,
+    model: str = "claude-sonnet-4-20250514",
+) -> Optional[str]:
+    """Call Anthropic Messages API via urllib. Returns response text or None."""
+    url = "https://api.anthropic.com/v1/messages"
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 12000,
+        "system": system,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }).encode("utf-8")
+
+    req = Request(url, data=payload, method="POST", headers={
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    })
+
+    try:
+        with urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+        return data["content"][0]["text"]
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:200]
+        print(f"  LLM API error {e.code}: {body}")
+        return None
+    except (URLError, OSError, KeyError, json.JSONDecodeError) as e:
+        print(f"  LLM API call failed: {e}")
+        return None
+
+
+def _extract_generate_signals(source: str) -> str:
+    """Extract the generate_signals method from the strategy file."""
+    marker = "    def generate_signals(self, df: pl.DataFrame) -> pl.Series:"
+    idx = source.find(marker)
+    if idx == -1:
+        raise ValueError("generate_signals not found in source")
+    return source[idx:]
+
+
+def _parse_llm_response(response: str) -> tuple[str, str, Optional[str]]:
+    """Parse diagnosis, change description, and code block from LLM response.
+
+    Returns (diagnosis, change_description, code_or_None).
+    """
+    # Extract diagnosis
+    diag_match = re.search(r"DIAGNOSIS:\s*(.+?)(?=\nCHANGE:|\n```)", response, re.DOTALL)
+    diagnosis = diag_match.group(1).strip() if diag_match else "No diagnosis provided."
+
+    # Extract change description
+    change_match = re.search(r"CHANGE:\s*(.+?)(?=\n```|\n\n)", response, re.DOTALL)
+    description = change_match.group(1).strip() if change_match else "No description provided."
+
+    # Extract Python code block
+    code_match = re.search(r"```python\s*\n(.*?)```", response, re.DOTALL)
+    if not code_match:
+        return diagnosis, description, None
+
+    code = code_match.group(1)
+
+    # Verify the code contains the expected method signature
+    if "def generate_signals" not in code:
+        return diagnosis, description, None
+
+    return diagnosis, description, code
+
+
+def _splice_method(original_source: str, new_method: str) -> str:
+    """Replace the generate_signals method body in the strategy file.
+
+    Keeps everything before the method (docstring, imports, class, __init__)
+    and replaces from 'def generate_signals' to EOF. This works because
+    generate_signals is the LAST method in the class (lines 117-EOF).
+    """
+    marker = "    def generate_signals(self, df: pl.DataFrame) -> pl.Series:"
+    idx = original_source.find(marker)
+    if idx == -1:
+        raise ValueError("generate_signals not found in source — cannot splice")
+    prefix = original_source[:idx]
+    return prefix + new_method.rstrip() + "\n"
+
+
+def _exec_and_generate(full_source: str, df) -> "pl.Series":
+    """Execute modified source via exec() and generate signals.
+
+    The source includes its own imports (polars, Strategy ABC), so the
+    exec namespace starts empty — imports resolve via sys.path.
+    """
+    import polars as pl  # noqa: F811 — needed for type check below
+
+    namespace: dict[str, Any] = {}
+    exec(compile(full_source, "volatility_squeeze_llm.py", "exec"), namespace)
+
+    strategy_cls = namespace.get("VolatilitySqueezeBreakout")
+    if strategy_cls is None:
+        raise RuntimeError("VolatilitySqueezeBreakout class not found in exec'd source")
+
+    strategy = strategy_cls()
+    signals = strategy.generate_signals(df)
+
+    # Validate signal contract
+    if not isinstance(signals, pl.Series):
+        raise TypeError(f"Expected pl.Series, got {type(signals).__name__}")
+    if len(signals) != len(df):
+        raise ValueError(f"Signal length {len(signals)} != DataFrame length {len(df)}")
+
+    vals = signals.drop_nulls()
+    if len(vals) > 0:
+        mn, mx = vals.min(), vals.max()
+        if mn < -1.0 or mx > 1.0:
+            raise ValueError(f"Signals out of range: min={mn}, max={mx}")
+
+    return signals
+
+
+def get_llm_mutation(
+    metrics: AuditMetrics,
+    stats: FailureStats,
+    model: str = "claude-sonnet-4-20250514",
+) -> Optional[MutationCandidate]:
+    """Phase 4b orchestrator: call LLM for a structural mutation proposal.
+
+    Safe-Solder Protocol — 5 validation gates:
+      1. compile() — syntax check
+      2. exec() — import resolution
+      3. Instantiation — no missing constructor args
+      4. Signal shape — len(signals) == len(df)
+      5. Signal range — all values in [-1.0, 1.0]
+
+    Returns MutationCandidate(is_llm=True) or None on any failure.
+    All failures are non-fatal — the deterministic path continues.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        print("  ANTHROPIC_API_KEY not set — skipping LLM mutation.")
+        return None
+
+    # Read current strategy source
+    strategy_source = STRATEGY_FILE.read_text(encoding="utf-8")
+    try:
+        method_source = _extract_generate_signals(strategy_source)
+    except ValueError as e:
+        print(f"  Cannot extract generate_signals: {e}")
+        return None
+
+    # Build prompt
+    user_prompt = _LLM_USER_TEMPLATE.format(
+        mean_slip=metrics.mean_alpha_leak_bps,
+        median_slip=metrics.median_alpha_leak_bps,
+        p95_time=metrics.p95_fill_time_s,
+        mean_time=metrics.mean_fill_time_s,
+        filled=metrics.filled_count,
+        cancelled=metrics.cancelled_count,
+        stuck=metrics.stuck_count,
+        narrative=stats.narrative,
+        method_source=method_source,
+    )
+
+    # Call API
+    print(f"  Calling {model}...")
+    response = _call_anthropic_api(api_key, _LLM_SYSTEM_PROMPT, user_prompt, model=model)
+    if not response:
+        return None
+
+    # Parse response
+    diagnosis, description, code = _parse_llm_response(response)
+    print(f"  Diagnosis: {diagnosis[:120]}...")
+    print(f"  Change:    {description[:120]}")
+
+    if code is None:
+        print("  No valid Python code block in LLM response — skipping.")
+        return None
+
+    # Splice into full file source
+    try:
+        full_source = _splice_method(strategy_source, code)
+    except ValueError as e:
+        print(f"  Splice failed: {e}")
+        return None
+
+    # Gate 1: compile()
+    try:
+        compile(full_source, "volatility_squeeze_llm.py", "exec")
+    except SyntaxError as e:
+        print(f"  Gate 1 FAIL — compile(): {e}")
+        return None
+    print("  Gate 1 ✓  compile()")
+
+    # Gates 2-5: exec + instantiate + generate + validate
+    smoke_df = generate_mock_ohlcv(symbol="BTC/USDT", hours=200, seed=99)
+    try:
+        _exec_and_generate(full_source, smoke_df)
+    except Exception as e:
+        print(f"  Gate 2-5 FAIL — exec/generate: {e}")
+        return None
+    print("  Gate 2 ✓  exec()  |  Gate 3 ✓  instantiate  |  Gate 4 ✓  shape  |  Gate 5 ✓  range")
+
+    return MutationCandidate(
+        name="LLM_STRUCTURAL",
+        rationale=f"{diagnosis} => {description}",
+        param_changes={},
+        full_params={},
+        is_llm=True,
+        llm_source=full_source,
+    )
+
+
+def _run_llm_backtest(
+    candidate: MutationCandidate,
+    baseline_report: GradingReport,
+    friction_bps: float,
+) -> Optional[MutationResult]:
+    """Run the LLM mutation through the full Proving Ground backtest."""
+    df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
+
+    try:
+        signals = _exec_and_generate(candidate.llm_source, df)
+    except Exception as e:
+        print(f"  LLM backtest runtime error: {e}")
+        return None
+
+    report = run_backtest(
+        df=df,
+        signals=signals,
+        init_cash=10_000.0,
+        fee_bps=10.0,
+        slippage_bps=friction_bps,
+        symbol="BTC/USDT",
+        strategy_name="LLM_STRUCTURAL",
+    )
+
+    base_sharpe = baseline_report.sharpe_ratio
+    if base_sharpe and base_sharpe != 0:
+        improvement = (report.sharpe_ratio - base_sharpe) / abs(base_sharpe) * 100.0
+    else:
+        improvement = 0.0
+
+    return MutationResult(
+        candidate=candidate,
+        label="L: LLM_STRUCTURAL",
+        report=report,
+        sharpe_improvement_pct=improvement,
+        meets_threshold=improvement >= (SHARPE_IMPROVEMENT_THRESHOLD - 1) * 100,
+        is_valid=report.total_trades >= MIN_TRADE_COUNT,
+    )
+
+
+# ===================================================================
 # Phase 5: Proving Ground
 # ===================================================================
 
@@ -663,27 +981,39 @@ def hotswap_decision(
         return None
 
     print(f"  Winner: {best.label}  (Sharpe {best.sharpe_improvement_pct:+.1f}% ≥ 10% threshold)")
-    print(f"  Changes: {best.candidate.param_changes}")
+    if best.candidate.is_llm:
+        print(f"  Type:    LLM structural mutation")
+        print(f"  Reason:  {best.candidate.rationale[:120]}")
+    else:
+        print(f"  Changes: {best.candidate.param_changes}")
 
     if dry_run:
         print("  [DRY-RUN] Would execute hot-swap (skipped).")
         return best  # Return to allow alert preview
 
-    # Read source
+    # Read current source for backup
     source = STRATEGY_FILE.read_text(encoding="utf-8")
 
-    # Build new source and validate before writing anything
-    try:
-        new_source = _rewrite_constructor_defaults(source, best.candidate.param_changes)
-    except ValueError as e:
-        print(f"  HOT-SWAP ABORTED: {e}")
-        return None
-
-    try:
-        compile(new_source, str(STRATEGY_FILE), "exec")
-    except SyntaxError as e:
-        print(f"  HOT-SWAP ABORTED: compile() failed: {e}")
-        return None
+    if best.candidate.is_llm and best.candidate.llm_source:
+        # ── LLM hot-swap: write pre-validated full source ──
+        new_source = best.candidate.llm_source
+        try:
+            compile(new_source, str(STRATEGY_FILE), "exec")
+        except SyntaxError as e:
+            print(f"  HOT-SWAP ABORTED (LLM): compile() failed: {e}")
+            return None
+    else:
+        # ── Deterministic hot-swap: str.replace on constructor defaults ──
+        try:
+            new_source = _rewrite_constructor_defaults(source, best.candidate.param_changes)
+        except ValueError as e:
+            print(f"  HOT-SWAP ABORTED: {e}")
+            return None
+        try:
+            compile(new_source, str(STRATEGY_FILE), "exec")
+        except SyntaxError as e:
+            print(f"  HOT-SWAP ABORTED: compile() failed: {e}")
+            return None
 
     # Backup then write
     STRATEGY_BACKUP.write_text(source, encoding="utf-8")
@@ -786,6 +1116,10 @@ def _parse_args() -> argparse.Namespace:
                    help=f"Slippage floor for Proving Ground (default: {PROVING_GROUND_SLIPPAGE_BPS})")
     p.add_argument("--threshold-bps", type=float, default=ALPHA_LEAK_THRESHOLD_BPS,
                    help=f"Alpha leak threshold for bridge override (default: {ALPHA_LEAK_THRESHOLD_BPS})")
+    p.add_argument("--enable-llm", action="store_true",
+                   help="Enable LLM structural mutation via Anthropic API (requires ANTHROPIC_API_KEY)")
+    p.add_argument("--llm-model", default="claude-sonnet-4-20250514",
+                   help="Anthropic model for LLM mutations (default: claude-sonnet-4-20250514)")
     return p.parse_args()
 
 
@@ -793,11 +1127,12 @@ def main() -> None:
     args = _parse_args()
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S UTC")
     mode_tag = "DRY-RUN" if args.dry_run else "LIVE"
+    llm_tag = " | LLM: ON" if args.enable_llm else ""
 
     W = 72
     print("=" * W)
     print(f"  META LOOP EXECUTION REPORT — {now_str}")
-    print(f"  Mode: {mode_tag} | Log dir: {args.log_dir} | Friction: {args.friction_bps}bps")
+    print(f"  Mode: {mode_tag} | Log dir: {args.log_dir} | Friction: {args.friction_bps}bps{llm_tag}")
     print("=" * W)
     print()
 
@@ -850,10 +1185,31 @@ def main() -> None:
         print()
 
         # -----------------------------------------------------------------
+        # Phase 4b: LLM Consultant (optional)
+        # -----------------------------------------------------------------
+        llm_candidate = None
+        if args.enable_llm:
+            print(f"[4b/6] LLM CONSULTANT  ({args.llm_model})")
+            llm_candidate = get_llm_mutation(metrics, stats, model=args.llm_model)
+            if llm_candidate is None:
+                print("  LLM mutation: not available (see above).")
+            print()
+
+        # -----------------------------------------------------------------
         # Phase 5: Proving Ground
         # -----------------------------------------------------------------
         print(f"[5/6] PROVING GROUND  (slippage_bps={args.friction_bps})")
         results = run_proving_ground(mutations, friction_bps=args.friction_bps)
+
+        # Phase 5b: LLM backtest (append to results if available)
+        if llm_candidate is not None:
+            baseline_report = results[0].report
+            llm_result = _run_llm_backtest(llm_candidate, baseline_report, args.friction_bps)
+            if llm_result is not None:
+                results.append(llm_result)
+            else:
+                print("  LLM mutation failed full backtest — excluded from ranking.")
+
         _print_comparison_table(results)
         print()
 
@@ -867,13 +1223,20 @@ def main() -> None:
             # Send Telegram alert
             alerter = TelegramAlerter()
             baseline = results[0]
-            param_changes_with_old = {
-                k: (BASELINE_PARAMS[k], v)
-                for k, v in winner.candidate.param_changes.items()
-            }
+            if winner.candidate.is_llm:
+                # LLM mutation: show rationale instead of param changes
+                param_changes_for_alert = {
+                    "type": ("deterministic", "LLM structural"),
+                    "change": ("—", winner.candidate.rationale[:80]),
+                }
+            else:
+                param_changes_for_alert = {
+                    k: (BASELINE_PARAMS[k], v)
+                    for k, v in winner.candidate.param_changes.items()
+                }
             alerter.mutation_accepted(
                 mutation_name=winner.candidate.name,
-                param_changes=param_changes_with_old,
+                param_changes=param_changes_for_alert,
                 old_cagr=baseline.report.cagr,
                 new_cagr=winner.report.cagr,
                 old_sharpe=baseline.report.sharpe_ratio,
