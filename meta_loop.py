@@ -1008,6 +1008,15 @@ def get_llm_mutation(
         method_source=method_source,
     )
 
+    # Persist full prompt for dashboard "Brain Audit" viewer
+    prompt_log = Path("logs/last_claude_prompt.txt")
+    prompt_log.parent.mkdir(parents=True, exist_ok=True)
+    prompt_log.write_text(
+        f"=== SYSTEM PROMPT ===\n{_LLM_SYSTEM_PROMPT}\n\n"
+        f"=== USER PROMPT ===\n{user_prompt}\n",
+        encoding="utf-8",
+    )
+
     # Call API
     print(f"  Calling {model}...")
     response = _call_anthropic_api(api_key, _LLM_SYSTEM_PROMPT, user_prompt, model=model)

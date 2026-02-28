@@ -34,6 +34,7 @@ LOGS_DIR = Path("logs")
 STRATEGY_FILE = Path("strategies/volatility_squeeze.py")
 STRATEGY_BACKUP = Path("strategies/volatility_squeeze.py.bak")
 MUTATION_META_FILE = Path("strategies/mutation_meta.json")
+LLM_PROMPT_LOG = Path("logs/last_claude_prompt.txt")
 BRIDGE_OVERRIDE_FILE = Path("bridge_override.json")
 
 SLIPPAGE_THRESHOLD_BPS: float = 10.0  # friction floor; bars above this → orange
@@ -664,6 +665,19 @@ def main() -> None:
 
     with tab2:
         render_mutation_tab(meta, diff_text, bak_source)
+
+        with st.expander("🔍 View Active LLM Prompt"):
+            if LLM_PROMPT_LOG.exists():
+                try:
+                    prompt_text = LLM_PROMPT_LOG.read_text(encoding="utf-8")
+                    st.code(prompt_text, language="markdown")
+                    st.caption(
+                        "This is the exact instruction set being sent to claude-sonnet-4."
+                    )
+                except Exception:
+                    st.info("Waiting for first LLM cycle to generate prompt log...")
+            else:
+                st.info("Waiting for first LLM cycle to generate prompt log...")
 
     with tab3:
         render_alpha_tab(audit_rows)
