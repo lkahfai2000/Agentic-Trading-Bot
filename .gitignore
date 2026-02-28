@@ -37,6 +37,9 @@ ENV/
 *.parquet
 data/
 
+# Bridge runtime logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db
