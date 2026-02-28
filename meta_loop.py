@@ -149,15 +149,22 @@ def _read_current_params(strategy_path: Path = STRATEGY_FILE) -> dict[str, Any]:
     return current
 
 
-def _make_cache_key(current_params: dict[str, Any], ranked_modes: list[str]) -> str:
-    """Deterministic fingerprint of baseline params + failure ranking.
+def _make_cache_key(
+    current_params: dict[str, Any],
+    mutations: list["MutationCandidate"],
+) -> str:
+    """Deterministic fingerprint of baseline params + actual proposed mutations.
 
-    If this key matches the cached key, the deterministic mutations would
-    produce identical proving-ground results — no point re-running them.
+    Includes mutation names and targets so the cache invalidates when code
+    changes produce different proposals for the same inputs.
     """
     param_str = json.dumps(current_params, sort_keys=True)
-    mode_str = ",".join(ranked_modes[:5])  # top-5 is enough
-    return f"{param_str}|{mode_str}"
+    mut_parts = []
+    for m in mutations:
+        changes_str = json.dumps(m.param_changes, sort_keys=True)
+        mut_parts.append(f"{m.name}:{changes_str}")
+    mut_str = "|".join(mut_parts)
+    return f"{param_str}||{mut_str}"
 
 
 def _load_proving_ground_cache() -> dict:
@@ -1490,7 +1497,7 @@ def main() -> None:
             print(f"       {m.rationale}")
 
         # Check cache — skip deterministic proving ground if identical to last run
-        cache_key = _make_cache_key(current_params, stats.ranked_modes)
+        cache_key = _make_cache_key(current_params, mutations)
         cached = _load_proving_ground_cache()
         deterministic_cached = cached.get("cache_key") == cache_key
 
