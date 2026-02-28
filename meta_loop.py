@@ -112,6 +112,42 @@ BASELINE_PARAMS: dict[str, Any] = {
     "cb_atr_lookback": 168,
 }
 
+
+def _read_current_params(strategy_path: Path = STRATEGY_FILE) -> dict[str, Any]:
+    """Parse current constructor defaults from the strategy source file.
+
+    Uses the same regex pattern style as _rewrite_constructor_defaults() to
+    ensure consistency between reading and writing.
+
+    Falls back to BASELINE_PARAMS if the file cannot be read or a param is
+    not found (safe degradation).
+    """
+    try:
+        source = strategy_path.read_text(encoding="utf-8")
+    except OSError:
+        return dict(BASELINE_PARAMS)
+
+    current = {}
+    for param, baseline_val in BASELINE_PARAMS.items():
+        type_hint = "int" if isinstance(baseline_val, int) else "float"
+        if type_hint == "int":
+            value_pattern = r"(\d+)"
+        else:
+            value_pattern = r"([\d]+\.[\d]+)"
+
+        match = re.search(
+            rf"{re.escape(param)}:\s*{re.escape(type_hint)}\s*=\s*{value_pattern}",
+            source,
+        )
+        if match:
+            raw = match.group(1)
+            current[param] = int(raw) if type_hint == "int" else float(raw)
+        else:
+            current[param] = baseline_val
+
+    return current
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -481,12 +517,19 @@ def _build_narrative(
 # Phase 4: Mutation proposals
 # ===================================================================
 
-def propose_mutations(stats: FailureStats) -> list[MutationCandidate]:
-    """Select exactly 3 MutationCandidates based on ranked failure modes.
+def propose_mutations(
+    stats: FailureStats,
+    current_params: dict[str, Any] | None = None,
+) -> list[MutationCandidate]:
+    """Select up to 3 MutationCandidates based on ranked failure modes.
 
     Deterministic: same FailureStats always produce the same mutations.
     Deduplicates by param_changes frozenset to avoid identical candidates.
+    Skips mutations whose target value already matches current production
+    params (no-op mutations).
     """
+    base = current_params if current_params is not None else BASELINE_PARAMS
+
     spec_by_mode: dict[str, tuple] = {
         spec[0]: spec for spec in _MUTATION_SPECS
     }
@@ -501,15 +544,21 @@ def propose_mutations(stats: FailureStats) -> list[MutationCandidate]:
             continue
 
         _, name, rationale, param_changes = spec_by_mode[mode]
-        key = frozenset(param_changes.items())
+
+        # Skip mutations whose target already matches production
+        effective = {k: v for k, v in param_changes.items() if base.get(k) != v}
+        if not effective:
+            continue
+
+        key = frozenset(effective.items())
         if key in seen_change_sets:
             continue
 
-        full_params = BASELINE_PARAMS | param_changes
+        full_params = base | effective
         selected.append(MutationCandidate(
             name=name,
             rationale=rationale,
-            param_changes=param_changes,
+            param_changes=effective,
             full_params=full_params,
         ))
         seen_change_sets.add(key)
@@ -518,12 +567,15 @@ def propose_mutations(stats: FailureStats) -> list[MutationCandidate]:
     for spec in _MUTATION_SPECS:
         if len(selected) >= 3:
             break
-        key = frozenset(spec[3].items())
+        effective = {k: v for k, v in spec[3].items() if base.get(k) != v}
+        if not effective:
+            continue
+        key = frozenset(effective.items())
         if key not in seen_change_sets:
-            full_params = BASELINE_PARAMS | spec[3]
+            full_params = base | effective
             selected.append(MutationCandidate(
                 name=spec[1], rationale=spec[2],
-                param_changes=spec[3], full_params=full_params,
+                param_changes=effective, full_params=full_params,
             ))
             seen_change_sets.add(key)
 
@@ -851,15 +903,19 @@ def _run_llm_backtest(
 def run_proving_ground(
     mutations: list[MutationCandidate],
     friction_bps: float = PROVING_GROUND_SLIPPAGE_BPS,
+    current_params: dict[str, Any] | None = None,
 ) -> list[MutationResult]:
-    """Run baseline + 3 mutations through the backtest engine.
+    """Run baseline + mutations through the backtest engine.
 
-    Returns list of 4 MutationResult objects; baseline is first (index 0).
+    Returns list of MutationResult objects; baseline is first (index 0).
+    ``current_params`` should be the live strategy file defaults so the
+    baseline matches actual production.
     """
+    base = current_params if current_params is not None else BASELINE_PARAMS
     df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
 
-    # Baseline
-    baseline_strategy = VolatilitySqueezeBreakout(**BASELINE_PARAMS)
+    # Baseline — use current production params, not hardcoded originals
+    baseline_strategy = VolatilitySqueezeBreakout(**base)
     baseline_report = run_backtest(
         df=df,
         signals=baseline_strategy.generate_signals(df),
@@ -1214,12 +1270,26 @@ def main() -> None:
         print()
 
         # -----------------------------------------------------------------
+        # Read current production params from strategy file
+        # -----------------------------------------------------------------
+        current_params = _read_current_params()
+        diffs = {k: (BASELINE_PARAMS[k], current_params[k])
+                 for k in BASELINE_PARAMS if BASELINE_PARAMS[k] != current_params[k]}
+        if diffs:
+            print("  Production params (vs original defaults):")
+            for k, (old, new) in diffs.items():
+                print(f"    {k}: {old} → {new}  (previously swapped)")
+            print()
+
+        # -----------------------------------------------------------------
         # Phase 4: Mutation proposals
         # -----------------------------------------------------------------
         print("[4/6] MUTATION PROPOSALS")
-        mutations = propose_mutations(stats)
+        mutations = propose_mutations(stats, current_params=current_params)
+        if not mutations:
+            print("  No effective mutations — all candidates match production params.")
         for i, m in enumerate(mutations, 1):
-            changes = ", ".join(f"{k}: {BASELINE_PARAMS[k]} → {v}" for k, v in m.param_changes.items())
+            changes = ", ".join(f"{k}: {current_params.get(k, '?')} → {v}" for k, v in m.param_changes.items())
             print(f"  M{i}  {m.name:<30}  {changes}")
             print(f"       {m.rationale}")
         print()
@@ -1239,7 +1309,7 @@ def main() -> None:
         # Phase 5: Proving Ground
         # -----------------------------------------------------------------
         print(f"[5/6] PROVING GROUND  (slippage_bps={args.friction_bps})")
-        results = run_proving_ground(mutations, friction_bps=args.friction_bps)
+        results = run_proving_ground(mutations, friction_bps=args.friction_bps, current_params=current_params)
 
         # Phase 5b: LLM backtest (append to results if available)
         if llm_candidate is not None:
@@ -1271,7 +1341,7 @@ def main() -> None:
                 }
             else:
                 param_changes_for_alert = {
-                    k: (BASELINE_PARAMS[k], v)
+                    k: (current_params.get(k, BASELINE_PARAMS[k]), v)
                     for k, v in winner.candidate.param_changes.items()
                 }
             alerter.mutation_accepted(

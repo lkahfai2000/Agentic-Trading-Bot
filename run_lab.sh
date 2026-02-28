@@ -203,6 +203,12 @@ while true; do
             log "HOT-SWAP detected (exit 2). Restarting bridge to load new strategy ..."
             kill_bridge
             sleep 5   # brief settle before restart
+            # Cooldown: wait until next hour before re-running meta_loop.
+            # Prevents rapid re-swaps if convergence logic has a bug.
+            WAIT=$(seconds_to_next_hour)
+            log "Post-swap cooldown: sleeping ${WAIT}s until next hour boundary ..."
+            start_bridge
+            sleep_with_bridge_check "$WAIT"
             ;;
         0)
             # No swap — sleep until next hour boundary
