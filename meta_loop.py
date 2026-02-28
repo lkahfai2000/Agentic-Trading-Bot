@@ -543,7 +543,11 @@ HARD RULES — violating ANY of these invalidates your output:
    .apply(), or .map_elements().
 2. The method signature MUST be exactly:
        def generate_signals(self, df: pl.DataFrame) -> pl.Series:
-3. df has columns: timestamp, open, high, low, close, volume (all Float64).
+3. df starts with: timestamp, open, high, low, close, volume (all Float64). \
+   The method adds computed columns (bb_mid, bb_upper, bb_lower, bb_std_val, \
+   true_range, atr, bbw, atr_baseline, atr_spike_ratio, cb_active, \
+   mom_1h, mom_4h, bull_1h, bull_4h, bear_1h, bear_4h, etc.). \
+   If you reference a column, you MUST ensure it is computed in a prior phase.
 4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df.
 5. Reference ONLY self.xxx attributes defined in the existing __init__. \
    Do NOT add new constructor parameters.
@@ -924,27 +928,36 @@ def _format_new_value(param: str, new_val: Any) -> str:
 
 
 def _rewrite_constructor_defaults(source: str, param_changes: dict[str, Any]) -> str:
-    """Rewrite constructor default values using exact str.replace() matching.
+    """Rewrite constructor default values using regex matching.
 
-    Raises ValueError if any parameter pattern is not found in source
-    (indicates the constructor signature has drifted from BASELINE_PARAMS).
+    Uses regex to match the current value in the source (whatever it is),
+    so hot-swap works even after a previous swap changed the value away
+    from BASELINE_PARAMS.
+
+    Raises ValueError if the parameter declaration is not found in source.
     """
     result = source
     for param, new_val in param_changes.items():
         old_val = BASELINE_PARAMS[param]
         type_hint = "int" if isinstance(old_val, int) else "float"
-        old_src = PARAM_SOURCE_STRINGS.get(param, str(old_val))
         new_src = _format_new_value(param, new_val)
 
-        old_pattern = f"{param}: {type_hint} = {old_src}"
-        new_pattern = f"{param}: {type_hint} = {new_src}"
+        # Match the parameter with any current numeric value
+        if type_hint == "int":
+            value_pattern = r"\d+"
+        else:
+            value_pattern = r"[\d]+\.[\d]+"
 
-        if old_pattern not in result:
+        regex = re.compile(
+            rf"({re.escape(param)}:\s*{re.escape(type_hint)}\s*=\s*){value_pattern}"
+        )
+
+        if not regex.search(result):
             raise ValueError(
-                f"Pattern '{old_pattern}' not found in source. "
-                f"Constructor signature may have changed since meta_loop was written."
+                f"Parameter '{param}: {type_hint} = ...' not found in source. "
+                f"Constructor signature may have changed."
             )
-        result = result.replace(old_pattern, new_pattern, 1)
+        result = regex.sub(rf"\g<1>{new_src}", result, count=1)
 
     return result
 
