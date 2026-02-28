@@ -37,6 +37,9 @@ class TheoreticalRecord:
     bear_regime: bool
     cb_active: bool
     max_usdt_allowed: float
+    sniper_active: bool = False
+    sniper_bull_confirmed: bool = False
+    sniper_bear_confirmed: bool = False
 
 
 @dataclass
@@ -188,6 +191,9 @@ def classify_events(raw_records: list[dict]) -> ParsedEvents:
                     bear_regime=raw["bear_regime"],
                     cb_active=raw["cb_active"],
                     max_usdt_allowed=raw["max_usdt_allowed"],
+                    sniper_active=raw.get("sniper_active", False),
+                    sniper_bull_confirmed=raw.get("sniper_bull_confirmed", False),
+                    sniper_bear_confirmed=raw.get("sniper_bear_confirmed", False),
                 )
                 parsed.theoretical[rec.cycle_id] = rec
 

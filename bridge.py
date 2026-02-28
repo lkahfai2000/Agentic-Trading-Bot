@@ -168,6 +168,9 @@ class DualTrackLogger:
         bear_regime: bool,
         cb_active: bool,
         max_usdt_allowed: float,
+        sniper_active: bool = False,
+        sniper_bull_confirmed: bool = False,
+        sniper_bear_confirmed: bool = False,
     ) -> None:
         record = {
             "track": "THEORETICAL",
@@ -181,6 +184,9 @@ class DualTrackLogger:
             "bear_regime": bear_regime,
             "cb_active": cb_active,
             "max_usdt_allowed": round(max_usdt_allowed, 2),
+            "sniper_active": sniper_active,
+            "sniper_bull_confirmed": sniper_bull_confirmed,
+            "sniper_bear_confirmed": sniper_bear_confirmed,
         }
         self._write(record)
         side = (
@@ -189,6 +195,7 @@ class DualTrackLogger:
         self._console.info(
             f"[THEORETICAL] signal={signal:+.4f} | delta={delta_qty_btc:+.6f} BTC "
             f"({side}) | bear={bear_regime} cb={cb_active}"
+            f" sniper={'ON' if sniper_active else 'OFF'}"
         )
 
     # -- ATTEMPTED track ----------------------------------------------------
@@ -859,6 +866,12 @@ class TradingBridge:
 
         signal = float(signals[-1]) if len(signals) > 0 else 0.0
 
+        # Extract sniper filter diagnostics (side-channel from strategy)
+        sniper_meta = getattr(self._strategy, "_sniper_meta", {})
+        sniper_active = sniper_meta.get("active", False)
+        sniper_bull = sniper_meta.get("bull_confirmed", False)
+        sniper_bear = sniper_meta.get("bear_confirmed", False)
+
         # Step 3: Compute regime context for dual-track logging
         bear_regime, cb_active = self._compute_regime_flags(df)
 
@@ -898,6 +911,9 @@ class TradingBridge:
             bear_regime=bear_regime,
             cb_active=cb_active,
             max_usdt_allowed=max_usdt,
+            sniper_active=sniper_active,
+            sniper_bull_confirmed=sniper_bull,
+            sniper_bear_confirmed=sniper_bear,
         )
 
         # Telegram: trade signal + hourly PnL snapshot

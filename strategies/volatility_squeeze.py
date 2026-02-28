@@ -129,6 +129,7 @@ class VolatilitySqueezeBreakout(Strategy):
         self.cb_atr_lookback = cb_atr_lookback
         self.sniper_ema_fast = sniper_ema_fast
         self.sniper_ema_slow = sniper_ema_slow
+        self._sniper_meta: dict = {"active": False}
 
     def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:
         # =====================================================================
@@ -333,6 +334,9 @@ class VolatilitySqueezeBreakout(Strategy):
                 pl.col("bear_confirmed").fill_null(False),
             ])
 
+            # Capture pre-gating entry counts for observability
+            pre_gate_entries = int(ind["long_entry"].sum()) + int(ind["short_entry"].sum())
+
             # Gate entries: 1h entry requires 15m cross confirmation
             ind = ind.with_columns([
                 (pl.col("long_entry") & pl.col("bull_confirmed")).alias(
@@ -342,6 +346,16 @@ class VolatilitySqueezeBreakout(Strategy):
                     "short_entry"
                 ),
             ])
+
+            post_gate_entries = int(ind["long_entry"].sum()) + int(ind["short_entry"].sum())
+            self._sniper_meta = {
+                "active": True,
+                "bull_confirmed": bool(ind["bull_confirmed"][-1]),
+                "bear_confirmed": bool(ind["bear_confirmed"][-1]),
+                "entries_gated": pre_gate_entries - post_gate_entries,
+            }
+        else:
+            self._sniper_meta = {"active": False}
 
         # =====================================================================
         # Phases 9-14: Convex Alpha Generator (NEW in V2)

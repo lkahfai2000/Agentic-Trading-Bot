@@ -115,10 +115,12 @@ def main() -> None:
         print(f"    Trades:   {rep.total_trades}", file=sys.stderr)
         print(f"    Win Rate: {rep.win_rate:.0%}", file=sys.stderr)
         print(f"    Time:     {r_1h['elapsed_ms']:.1f}ms", file=sys.stderr)
+        print(f"    Sniper:   OFF (1h only)", file=sys.stderr)
 
         # MTF: 1h + 15m sniper filter
         r_mtf = run_strategy(strategy, df_1h, df_fast=df_15m)
         rep = r_mtf["report"]
+        sniper = getattr(strategy, "_sniper_meta", {})
         print(f"\n  [1h + 15m Sniper]:", file=sys.stderr)
         print(f"    CAGR:     {rep.cagr*100:+.1f}%", file=sys.stderr)
         print(f"    Max DD:   {rep.max_drawdown*100:.1f}%", file=sys.stderr)
@@ -126,6 +128,7 @@ def main() -> None:
         print(f"    Trades:   {rep.total_trades}", file=sys.stderr)
         print(f"    Win Rate: {rep.win_rate:.0%}", file=sys.stderr)
         print(f"    Time:     {r_mtf['elapsed_ms']:.1f}ms", file=sys.stderr)
+        print(f"    Sniper:   {sniper.get('entries_gated', 0)} entries gated by 15m filter", file=sys.stderr)
 
         output = [
             {**r_1h["report"].model_dump(), "strategy_name": "Squeeze_1h_Only"},
