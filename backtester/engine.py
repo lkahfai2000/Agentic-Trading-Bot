@@ -8,17 +8,20 @@ from .schema import GradingReport
 
 
 def _validate_signals(signals: pl.Series, expected_len: int) -> None:
-    """Validate signal Series contains only {-1, 0, 1} and has correct length."""
+    """Validate signal Series values are in [-1.0, 1.0] and has correct length."""
     if len(signals) != expected_len:
         raise ValueError(
             f"Signal length ({len(signals)}) != DataFrame length ({expected_len})"
         )
-    unique_vals = set(signals.unique().to_list())
-    invalid = unique_vals - {-1, 0, 1, None}
-    if invalid:
-        raise ValueError(
-            f"Signals contain invalid values: {invalid}. Only -1, 0, 1 allowed."
-        )
+    non_null = signals.drop_nulls()
+    if len(non_null) > 0:
+        min_val = float(non_null.min())
+        max_val = float(non_null.max())
+        if min_val < -1.0 or max_val > 1.0:
+            raise ValueError(
+                f"Signals out of range: min={min_val}, max={max_val}. "
+                f"Must be in [-1.0, 1.0]."
+            )
 
 
 def run_backtest(
@@ -39,7 +42,7 @@ def run_backtest(
 
     Args:
         df: OHLCV DataFrame with columns [timestamp, open, high, low, close, volume].
-        signals: Series of Int32 signals (1=Long, -1=Short, 0=Flat).
+        signals: Series of signals in [-1.0, 1.0] (1=Long, -1=Short, 0=Flat, fractional=partial size).
         init_cash: Starting capital.
         fee_bps: Trading fee in basis points (10 = 0.1%).
         slippage_bps: Slippage in basis points (10 = 0.1%).
@@ -56,7 +59,7 @@ def run_backtest(
 
     # --- Build backtest DataFrame ---
     # T+1 execution: signal at row T becomes position at row T+1
-    position = signals.shift(1).fill_null(0).cast(pl.Int32).alias("position")
+    position = signals.cast(pl.Float64).shift(1).fill_null(0.0).alias("position")
 
     bt = df.select([
         pl.col("timestamp"),
@@ -205,10 +208,11 @@ def _compute_win_rate(bt: pl.DataFrame) -> float:
     if positions.n_unique() <= 1:
         return 0.0
 
-    # Mark the start of each new trade segment (position changes to/from zero,
-    # or flips direction)
-    pos_changed = (positions != positions.shift(1).fill_null(0)).cast(pl.Int32)
-    trade_id = pos_changed.cum_sum().alias("trade_id")
+    # Mark the start of each new trade segment by direction flips (sign changes),
+    # not magnitude changes — supports fractional position sizing
+    pos_sign = positions.sign().cast(pl.Int32)
+    sign_changed = (pos_sign != pos_sign.shift(1).fill_null(0)).cast(pl.Int32)
+    trade_id = sign_changed.cum_sum().alias("trade_id")
 
     trades_df = bt.with_columns(trade_id).filter(pl.col("position") != 0)
 
