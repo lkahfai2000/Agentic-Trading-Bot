@@ -43,6 +43,7 @@ logs/
 # meta_loop.py runtime artifacts
 bridge_override.json
 strategies/*.py.bak
+strategies/mutation_meta.json
 
 # OS
 .DS_Store

@@ -949,8 +949,33 @@ def _rewrite_constructor_defaults(source: str, param_changes: dict[str, Any]) ->
     return result
 
 
+def _write_mutation_meta(
+    best: MutationResult,
+    baseline: MutationResult,
+    failure_narrative: str,
+) -> None:
+    """Persist hot-swap metadata to strategies/mutation_meta.json for the dashboard."""
+    meta = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "mutation_name": best.candidate.name,
+        "rationale": best.candidate.rationale,
+        "is_llm": best.candidate.is_llm,
+        "param_changes": {k: str(v) for k, v in best.candidate.param_changes.items()},
+        "old_sharpe": baseline.report.sharpe_ratio,
+        "new_sharpe": best.report.sharpe_ratio,
+        "old_cagr": baseline.report.cagr,
+        "new_cagr": best.report.cagr,
+        "sharpe_improvement_pct": best.sharpe_improvement_pct,
+        "failure_narrative": failure_narrative,
+    }
+    dest = Path("strategies/mutation_meta.json")
+    dest.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"  Meta:   {dest}  ✓")
+
+
 def hotswap_decision(
     results: list[MutationResult],
+    failure_narrative: str = "",
     dry_run: bool = False,
 ) -> Optional[MutationResult]:
     """Evaluate the hot-swap gate and execute swap if threshold is met.
@@ -1021,6 +1046,8 @@ def hotswap_decision(
 
     STRATEGY_FILE.write_text(new_source, encoding="utf-8")
     print(f"  Swap:   {STRATEGY_FILE}  ✓")
+
+    _write_mutation_meta(best, baseline, failure_narrative)
 
     return best
 
@@ -1217,7 +1244,7 @@ def main() -> None:
         # Phase 6: Hot-swap decision
         # -----------------------------------------------------------------
         print("[6/6] HOT-SWAP DECISION")
-        winner = hotswap_decision(results, dry_run=args.dry_run)
+        winner = hotswap_decision(results, failure_narrative=stats.narrative, dry_run=args.dry_run)
 
         if winner is not None and winner.candidate is not None:
             # Send Telegram alert
