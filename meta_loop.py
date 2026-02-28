@@ -66,6 +66,7 @@ MIN_TRADE_COUNT: int = 5                     # minimum trades for a valid backte
 BRIDGE_OVERRIDE_PATH = Path("bridge_override.json")
 STRATEGY_FILE = Path("strategies/volatility_squeeze.py")
 STRATEGY_BACKUP = Path("strategies/volatility_squeeze.py.bak")
+PROVING_GROUND_CACHE = Path("strategies/proving_ground_cache.json")
 
 # Exact literal strings from the volatility_squeeze.py __init__ signature.
 # Used by str.replace() to avoid float formatting ambiguity.
@@ -146,6 +147,49 @@ def _read_current_params(strategy_path: Path = STRATEGY_FILE) -> dict[str, Any]:
             current[param] = baseline_val
 
     return current
+
+
+def _make_cache_key(current_params: dict[str, Any], ranked_modes: list[str]) -> str:
+    """Deterministic fingerprint of baseline params + failure ranking.
+
+    If this key matches the cached key, the deterministic mutations would
+    produce identical proving-ground results — no point re-running them.
+    """
+    param_str = json.dumps(current_params, sort_keys=True)
+    mode_str = ",".join(ranked_modes[:5])  # top-5 is enough
+    return f"{param_str}|{mode_str}"
+
+
+def _load_proving_ground_cache() -> dict:
+    """Load the proving ground result cache (if it exists)."""
+    try:
+        return json.loads(PROVING_GROUND_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_proving_ground_cache(
+    cache_key: str,
+    results: list["MutationResult"],
+) -> None:
+    """Persist the proving ground results so identical runs can be skipped."""
+    entries = []
+    for r in results:
+        entries.append({
+            "label": r.label,
+            "sharpe": r.report.sharpe_ratio,
+            "cagr": r.report.cagr,
+            "max_dd": r.report.max_drawdown,
+            "trades": r.report.total_trades,
+            "improvement_pct": r.sharpe_improvement_pct,
+            "meets_threshold": r.meets_threshold,
+        })
+    cache = {
+        "cache_key": cache_key,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "results": entries,
+    }
+    PROVING_GROUND_CACHE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1305,6 +1349,22 @@ def main() -> None:
             changes = ", ".join(f"{k}: {current_params.get(k, '?')} → {v}" for k, v in m.param_changes.items())
             print(f"  M{i}  {m.name:<30}  {changes}")
             print(f"       {m.rationale}")
+
+        # Check cache — skip deterministic proving ground if identical to last run
+        cache_key = _make_cache_key(current_params, stats.ranked_modes)
+        cached = _load_proving_ground_cache()
+        deterministic_cached = cached.get("cache_key") == cache_key
+
+        if deterministic_cached:
+            print()
+            print("  ↳ Deterministic mutations unchanged since last run — cached.")
+            best_cached = max(
+                (r for r in cached["results"] if r["label"] != "Baseline (Production)"),
+                key=lambda r: r["improvement_pct"],
+                default=None,
+            )
+            if best_cached:
+                print(f"    Best was {best_cached['label']} at {best_cached['improvement_pct']:+.1f}% (threshold: +10%)")
         print()
 
         # -----------------------------------------------------------------
@@ -1321,26 +1381,45 @@ def main() -> None:
         # -----------------------------------------------------------------
         # Phase 5: Proving Ground
         # -----------------------------------------------------------------
-        print(f"[5/6] PROVING GROUND  (slippage_bps={args.friction_bps})")
-        results = run_proving_ground(mutations, friction_bps=args.friction_bps, current_params=current_params)
+        if deterministic_cached and llm_candidate is None:
+            # Nothing new to test — skip proving ground entirely
+            print(f"[5/6] PROVING GROUND  (skipped — deterministic cached, no LLM candidate)")
+            print()
+            print("[6/6] HOT-SWAP DECISION")
+            print("  Skipped — no new mutations to evaluate.")
+            winner = None
+        else:
+            print(f"[5/6] PROVING GROUND  (slippage_bps={args.friction_bps})")
 
-        # Phase 5b: LLM backtest (append to results if available)
-        if llm_candidate is not None:
-            baseline_report = results[0].report
-            llm_result = _run_llm_backtest(llm_candidate, baseline_report, args.friction_bps)
-            if llm_result is not None:
-                results.append(llm_result)
+            if deterministic_cached:
+                # Only run baseline + LLM (skip redundant deterministic backtests)
+                print("  Deterministic mutations cached — running baseline + LLM only.")
+                results = run_proving_ground([], friction_bps=args.friction_bps, current_params=current_params)
             else:
-                print("  LLM mutation failed full backtest — excluded from ranking.")
+                results = run_proving_ground(mutations, friction_bps=args.friction_bps, current_params=current_params)
 
-        _print_comparison_table(results)
-        print()
+            # Phase 5b: LLM backtest (append to results if available)
+            if llm_candidate is not None:
+                baseline_report = results[0].report
+                llm_result = _run_llm_backtest(llm_candidate, baseline_report, args.friction_bps)
+                if llm_result is not None:
+                    results.append(llm_result)
+                else:
+                    print("  LLM mutation failed full backtest — excluded from ranking.")
 
-        # -----------------------------------------------------------------
-        # Phase 6: Hot-swap decision
-        # -----------------------------------------------------------------
-        print("[6/6] HOT-SWAP DECISION")
-        winner = hotswap_decision(results, failure_narrative=stats.narrative, dry_run=args.dry_run)
+            _print_comparison_table(results)
+            print()
+
+            # Cache deterministic results for next run (only if we ran them)
+            if not deterministic_cached:
+                det_results = [r for r in results if not (r.candidate and r.candidate.is_llm)]
+                _save_proving_ground_cache(cache_key, det_results)
+
+            # -----------------------------------------------------------
+            # Phase 6: Hot-swap decision
+            # -----------------------------------------------------------
+            print("[6/6] HOT-SWAP DECISION")
+            winner = hotswap_decision(results, failure_narrative=stats.narrative, dry_run=args.dry_run)
 
         if winner is not None and winner.candidate is not None:
             # Send Telegram alert
