@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -1013,35 +1014,43 @@ class TradingBridge:
         # epoch_hour avoids day-boundary ambiguity of datetime.hour
         last_epoch_hour = -1
 
-        while True:
-            # Health check every iteration (every 60s)
-            self._run_health_check()
+        try:
+            while True:
+                # Health check every iteration (every 60s)
+                self._run_health_check()
 
-            if self._health.is_paused():
-                self._trigger_system_pause(
-                    f"Data fetch failed "
-                    f"{self._cfg.max_consecutive_failures} consecutive "
-                    f"health checks ({self._cfg.max_consecutive_failures} "
-                    f"minutes). Exchange may be unreachable."
-                )
-
-            # Full trading cycle on epoch-hour boundary
-            epoch_hour = (
-                int(datetime.now(timezone.utc).timestamp()) // 3600
-            )
-            if epoch_hour != last_epoch_hour:
-                try:
-                    self._run_cycle()
-                except Exception as e:
-                    # Catch-all so the loop never dies unexpectedly
-                    self._log.log_order_error(
-                        "UNHANDLED_EXCEPTION",
-                        str(e),
-                        {"type": type(e).__name__},
+                if self._health.is_paused():
+                    self._trigger_system_pause(
+                        f"Data fetch failed "
+                        f"{self._cfg.max_consecutive_failures} consecutive "
+                        f"health checks ({self._cfg.max_consecutive_failures} "
+                        f"minutes). Exchange may be unreachable."
                     )
-                last_epoch_hour = epoch_hour
 
-            time.sleep(self._cfg.health_poll_interval)
+                # Full trading cycle on epoch-hour boundary
+                epoch_hour = (
+                    int(datetime.now(timezone.utc).timestamp()) // 3600
+                )
+                if epoch_hour != last_epoch_hour:
+                    try:
+                        self._run_cycle()
+                    except Exception as e:
+                        # Catch-all so the loop never dies unexpectedly
+                        self._log.log_order_error(
+                            "UNHANDLED_EXCEPTION",
+                            str(e),
+                            {"type": type(e).__name__},
+                        )
+                    last_epoch_hour = epoch_hour
+
+                time.sleep(self._cfg.health_poll_interval)
+        finally:
+            # Auto-audit on any exit: Ctrl+C, sys.exit, or crash
+            self._log.log_system_event("SHUTDOWN", "Running post-session audit...")
+            subprocess.run(
+                [sys.executable, "audit.py", self._cfg.log_dir],
+                cwd=Path(__file__).parent,
+            )
 
 
 # ---------------------------------------------------------------------------
