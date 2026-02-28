@@ -295,6 +295,46 @@ _MUTATION_SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# Incremental mutation definitions
+# ---------------------------------------------------------------------------
+# When fixed-target mutations are exhausted (target == current), generate
+# incremental steps from the current value.  Each entry maps a failure mode
+# to a list of (param, step, min, max, rationale_template) tuples.
+# step is added to current value; negative steps explore the other direction.
+# rationale_template uses {param}, {old}, {new}.
+
+_INCREMENTAL_SPECS: dict[str, list[tuple[str, float, float, float, str]]] = {
+    "bear_regime": [
+        ("bear_size_factor", 0.06, 0.02, 0.50,
+         "Incremental: raise bear sizing {old}→{new} to capture more bear-market entries"),
+        ("bear_ema_span", -100, 200, 1200,
+         "Incremental: shorten bear EMA {old}→{new} for faster regime detection"),
+    ],
+    "cb_active": [
+        ("cb_atr_mult", 0.5, 2.0, 6.0,
+         "Incremental: raise CB threshold {old}→{new} to reduce false flattenings"),
+        ("cb_atr_lookback", 24, 72, 336,
+         "Incremental: lengthen CB lookback {old}→{new} for more stable baseline ATR"),
+    ],
+    "cancel_timeout": [
+        ("adx_threshold", 2.0, 15.0, 40.0,
+         "Incremental: raise ADX threshold {old}→{new} for higher-conviction entries"),
+    ],
+    "pad_a": [
+        ("bb_std", 0.2, 1.5, 3.5,
+         "Incremental: widen BB std {old}→{new} to reduce whipsaw entries"),
+        ("bb_period", 5, 10, 50,
+         "Incremental: lengthen BB period {old}→{new} for smoother bands"),
+    ],
+    "pad_b": [
+        ("atr_stop_mult", 0.5, 2.0, 6.0,
+         "Incremental: widen ATR stop {old}→{new} for more breathing room"),
+        ("squeeze_pctile", -0.02, 0.03, 0.20,
+         "Incremental: adjust squeeze percentile {old}→{new}"),
+    ],
+}
+
 
 # ===================================================================
 # Phase 1: Audit ingestion
@@ -561,16 +601,64 @@ def _build_narrative(
 # Phase 4: Mutation proposals
 # ===================================================================
 
+def _make_incremental(
+    mode: str,
+    base: dict[str, Any],
+    seen_params: set[str],
+) -> MutationCandidate | None:
+    """Generate an incremental mutation for a failure mode.
+
+    Steps the first available parameter from its current value.
+    Skips params already mutated in this batch.
+    """
+    specs = _INCREMENTAL_SPECS.get(mode)
+    if not specs:
+        return None
+
+    for param, step, lo, hi, rationale_tpl in specs:
+        if param in seen_params:
+            continue
+        current = base.get(param)
+        if current is None:
+            continue
+
+        new_val = current + step
+        # Clamp to bounds
+        new_val = max(lo, min(hi, new_val))
+        # Round to avoid float drift
+        if isinstance(BASELINE_PARAMS.get(param), int):
+            new_val = int(round(new_val))
+        else:
+            new_val = round(new_val, 4)
+
+        if new_val == current:
+            continue  # at boundary, try next param
+
+        rationale = rationale_tpl.format(param=param, old=current, new=new_val)
+        suffix = f"_{param.upper()}"
+        return MutationCandidate(
+            name=f"INCR{suffix}",
+            rationale=rationale,
+            param_changes={param: new_val},
+            full_params=base | {param: new_val},
+        )
+
+    return None
+
+
 def propose_mutations(
     stats: FailureStats,
     current_params: dict[str, Any] | None = None,
 ) -> list[MutationCandidate]:
     """Select up to 3 MutationCandidates based on ranked failure modes.
 
-    Deterministic: same FailureStats always produce the same mutations.
-    Deduplicates by param_changes frozenset to avoid identical candidates.
-    Skips mutations whose target value already matches current production
-    params (no-op mutations).
+    First tries fixed-target mutations from _MUTATION_SPECS.  When a fixed
+    target matches the current production value (already applied or no-op),
+    falls back to incremental mutations that step the parameter from its
+    current value.
+
+    Deterministic: same FailureStats + current_params always produce
+    the same mutations.
     """
     base = current_params if current_params is not None else BASELINE_PARAMS
 
@@ -580,6 +668,7 @@ def propose_mutations(
 
     selected: list[MutationCandidate] = []
     seen_change_sets: set[frozenset] = set()
+    seen_params: set[str] = set()  # params already mutated (for incremental dedup)
 
     for mode in stats.ranked_modes:
         if len(selected) >= 3:
@@ -589,9 +678,34 @@ def propose_mutations(
 
         _, name, rationale, param_changes = spec_by_mode[mode]
 
-        # Skip mutations whose target already matches production
+        # Skip mutations whose target already matches production or
+        # where current has already moved past the fixed target
         effective = {k: v for k, v in param_changes.items() if base.get(k) != v}
+        use_incremental = False
         if not effective:
+            use_incremental = True
+        else:
+            # Check if any param has moved past the fixed target
+            # (e.g., bear_size_factor is 0.26 but target is 0.20 — going backwards)
+            for k, target_v in param_changes.items():
+                baseline_v = BASELINE_PARAMS.get(k)
+                current_v = base.get(k)
+                if baseline_v is not None and current_v is not None:
+                    direction = target_v - baseline_v  # positive = increase
+                    if direction > 0 and current_v > target_v:
+                        use_incremental = True
+                        break
+                    if direction < 0 and current_v < target_v:
+                        use_incremental = True
+                        break
+        if use_incremental:
+            incr = _make_incremental(mode, base, seen_params)
+            if incr is not None:
+                key = frozenset(incr.param_changes.items())
+                if key not in seen_change_sets:
+                    selected.append(incr)
+                    seen_change_sets.add(key)
+                    seen_params.update(incr.param_changes.keys())
             continue
 
         key = frozenset(effective.items())
@@ -606,13 +720,37 @@ def propose_mutations(
             full_params=full_params,
         ))
         seen_change_sets.add(key)
+        seen_params.update(effective.keys())
 
-    # Safety: should never be needed given pad_a/pad_b, but be defensive
+    # Fallback: fill remaining slots from specs + incremental
     for spec in _MUTATION_SPECS:
         if len(selected) >= 3:
             break
-        effective = {k: v for k, v in spec[3].items() if base.get(k) != v}
+        param_changes = spec[3]
+        effective = {k: v for k, v in param_changes.items() if base.get(k) != v}
+        use_incr = False
         if not effective:
+            use_incr = True
+        else:
+            for k, target_v in param_changes.items():
+                baseline_v = BASELINE_PARAMS.get(k)
+                current_v = base.get(k)
+                if baseline_v is not None and current_v is not None:
+                    direction = target_v - baseline_v
+                    if direction > 0 and current_v > target_v:
+                        use_incr = True
+                        break
+                    if direction < 0 and current_v < target_v:
+                        use_incr = True
+                        break
+        if use_incr:
+            incr = _make_incremental(spec[0], base, seen_params)
+            if incr is not None:
+                key = frozenset(incr.param_changes.items())
+                if key not in seen_change_sets:
+                    selected.append(incr)
+                    seen_change_sets.add(key)
+                    seen_params.update(incr.param_changes.keys())
             continue
         key = frozenset(effective.items())
         if key not in seen_change_sets:
@@ -622,6 +760,7 @@ def propose_mutations(
                 param_changes=effective, full_params=full_params,
             ))
             seen_change_sets.add(key)
+            seen_params.update(effective.keys())
 
     return selected[:3]
 
