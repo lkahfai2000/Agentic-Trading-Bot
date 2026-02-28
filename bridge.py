@@ -48,6 +48,7 @@ from typing import Optional
 import ccxt
 import polars as pl
 
+from alerts import TelegramAlerter
 from strategies.volatility_squeeze import VolatilitySqueezeBreakout
 
 
@@ -435,6 +436,7 @@ class OrderManager:
         self,
         client: BinanceTestnetClient,
         logger: DualTrackLogger,
+        alerter: TelegramAlerter,
         cancel_after_seconds: int = 300,
         poll_interval_seconds: int = 30,
         retry_slippage_bps: float = 15.0,
@@ -442,6 +444,7 @@ class OrderManager:
     ) -> None:
         self._client = client
         self._log = logger
+        self._alerts = alerter
         self._cancel_after = cancel_after_seconds
         self._poll_interval = poll_interval_seconds
         self._retry_slip = retry_slippage_bps / 10_000.0
@@ -514,6 +517,10 @@ class OrderManager:
             self._log.log_order_placed(
                 fake_id, side.upper(), qty, price, is_retry
             )
+            self._alerts.order_event(
+                "ORDER_PLACED", fake_id,
+                side=side.upper(), qty=qty, price=price, is_retry=is_retry,
+            )
             return fake_id
 
         try:
@@ -525,6 +532,10 @@ class OrderManager:
             order_id = order["id"]
             self._log.log_order_placed(
                 order_id, side.upper(), qty, price, is_retry
+            )
+            self._alerts.order_event(
+                "ORDER_PLACED", order_id,
+                side=side.upper(), qty=qty, price=price, is_retry=is_retry,
             )
             return order_id
 
@@ -577,16 +588,24 @@ class OrderManager:
                 status = order.get("status", "unknown")
 
                 if status == "closed":
+                    fq = float(order.get("filled", 0.0))
+                    ap = float(order.get("average", 0.0))
                     self._log.log_order_filled(
-                        order_id,
-                        filled_qty=float(order.get("filled", 0.0)),
-                        avg_price=float(order.get("average", 0.0)),
+                        order_id, filled_qty=fq, avg_price=ap,
+                    )
+                    self._alerts.order_event(
+                        "ORDER_FILLED", order_id,
+                        filled_qty=fq, avg_price=ap,
                     )
                     return True
 
                 if status == "canceled":
                     self._log.log_order_cancelled(
                         order_id, reason="EXCHANGE_CANCELLED"
+                    )
+                    self._alerts.order_event(
+                        "ORDER_CANCELLED", order_id,
+                        reason="EXCHANGE_CANCELLED",
                     )
                     return False
 
@@ -655,9 +674,11 @@ class TradingBridge:
         self._strategy = VolatilitySqueezeBreakout()
         self._log = DualTrackLogger(config.log_dir, config.log_level)
         self._health = HealthMonitor(config.max_consecutive_failures)
+        self._alerts = TelegramAlerter()
         self._order_mgr = OrderManager(
             client=client,
             logger=self._log,
+            alerter=self._alerts,
             cancel_after_seconds=config.cancel_after_seconds,
             poll_interval_seconds=config.poll_interval_seconds,
             retry_slippage_bps=config.retry_slippage_bps,
@@ -854,6 +875,22 @@ class TradingBridge:
             max_usdt_allowed=max_usdt,
         )
 
+        # Telegram: trade signal + hourly PnL snapshot
+        self._alerts.trade_signal(
+            signal=signal,
+            delta_qty_btc=delta_btc,
+            current_price_usd=current_price,
+            bear_regime=bear_regime,
+            cb_active=cb_active,
+            cycle_id=self._log._cycle_id,
+        )
+        self._alerts.hourly_pnl(
+            usdt_free=usdt_free,
+            btc_total=btc_held,
+            btc_price=current_price,
+            cycle_id=self._log._cycle_id,
+        )
+
         # Step 8: Is the trade worth executing?
         delta_notional = abs(delta_btc) * current_price
         if delta_notional < self._cfg.min_trade_notional:
@@ -891,10 +928,15 @@ class TradingBridge:
             self._health.record_success()
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
             count = self._health.record_failure()
-            self._log.log_system_event(
-                "HEALTH_FAIL",
+            detail = (
                 f"consecutive={count}/{self._cfg.max_consecutive_failures} "
-                f"| {type(e).__name__}: {e}",
+                f"| {type(e).__name__}: {e}"
+            )
+            self._log.log_system_event("HEALTH_FAIL", detail)
+            self._alerts.health_failure(
+                consecutive=count,
+                max_failures=self._cfg.max_consecutive_failures,
+                error_detail=str(e),
             )
 
     # -- System pause -------------------------------------------------------
@@ -902,6 +944,7 @@ class TradingBridge:
     def _trigger_system_pause(self, reason: str) -> None:
         """Halt trading and alert operator until manual restart."""
         self._log.log_system_event("SYSTEM_PAUSE", reason)
+        self._alerts.system_pause(reason)
         print(
             f"\n{'=' * 60}\n"
             f"  *** SYSTEM PAUSE TRIGGERED ***\n"
@@ -956,6 +999,11 @@ class TradingBridge:
             f"Bridge starting [{mode}] | symbol={self._cfg.symbol} "
             f"exposure={self._cfg.max_account_exposure:.0%} "
             f"timeframe={self._cfg.timeframe}",
+        )
+        self._alerts.startup(
+            mode=mode,
+            symbol=self._cfg.symbol,
+            exposure=self._cfg.max_account_exposure,
         )
 
         # Clean up any orphaned orders from a previous run
