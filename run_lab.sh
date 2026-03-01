@@ -3,7 +3,7 @@
 #
 # Runs bridge.py in the background and meta_loop.py in a loop.
 # On hot-swap (exit 2): restarts bridge to load new strategy code.
-# On no-swap  (exit 0): sleeps until the next hour, then reruns.
+# On no-swap  (exit 0): sleeps until the next 15m boundary, then reruns.
 # On error    (exit 1): sends Telegram alert, halts for manual intervention.
 #
 # Usage:
@@ -21,7 +21,7 @@ set -uo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOG_DIR="${SCRIPT_DIR}/logs"
 readonly WRAPPER_LOG="${LOG_DIR}/wrapper.log"
-readonly META_LOOP_SLEEP=3600   # seconds between meta_loop runs on exit 0
+readonly META_LOOP_SLEEP=900    # seconds between meta_loop runs on exit 0
 
 BRIDGE_PID=""
 
@@ -139,18 +139,19 @@ sleep_with_bridge_check() {
     done
 }
 
-# ── Compute seconds until next hour boundary ─────────────────────────
-seconds_to_next_hour() {
-    local now_min now_sec wait_s
+# ── Compute seconds until next 15-minute boundary ────────────────────
+seconds_to_next_quarter() {
+    local now_min now_sec min_in_quarter wait_s
     now_min=$(date -u +"%M")
     now_sec=$(date -u +"%S")
     # Strip leading zeros for arithmetic
     now_min=$((10#$now_min))
     now_sec=$((10#$now_sec))
-    wait_s=$(( (60 - now_min) * 60 - now_sec ))
-    # If we're exactly on the hour, wait a full hour
+    min_in_quarter=$(( now_min % 15 ))
+    wait_s=$(( (15 - min_in_quarter) * 60 - now_sec ))
+    # If we're exactly on a 15m boundary, wait a full 15 minutes
     if (( wait_s <= 0 )); then
-        wait_s=3600
+        wait_s=900
     fi
     echo "$wait_s"
 }
@@ -203,17 +204,17 @@ while true; do
             log "HOT-SWAP detected (exit 2). Restarting bridge to load new strategy ..."
             kill_bridge
             sleep 5   # brief settle before restart
-            # Cooldown: wait until next hour before re-running meta_loop.
+            # Cooldown: wait until next 15m boundary before re-running meta_loop.
             # Prevents rapid re-swaps if convergence logic has a bug.
-            WAIT=$(seconds_to_next_hour)
-            log "Post-swap cooldown: sleeping ${WAIT}s until next hour boundary ..."
+            WAIT=$(seconds_to_next_quarter)
+            log "Post-swap cooldown: sleeping ${WAIT}s until next 15m boundary ..."
             start_bridge
             sleep_with_bridge_check "$WAIT"
             ;;
         0)
-            # No swap — sleep until next hour boundary
-            WAIT=$(seconds_to_next_hour)
-            log "No swap (exit 0). Sleeping ${WAIT}s until next hour ..."
+            # No swap — sleep until next 15m boundary
+            WAIT=$(seconds_to_next_quarter)
+            log "No swap (exit 0). Sleeping ${WAIT}s until next 15m boundary ..."
             sleep_with_bridge_check "$WAIT"
             ;;
         *)

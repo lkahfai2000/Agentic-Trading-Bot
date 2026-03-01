@@ -18,8 +18,8 @@ class GradingReport(BaseModel):
     max_drawdown: float = Field(
         description="Maximum drawdown magnitude as decimal (negative, e.g. -0.25 = -25%)"
     )
-    max_drawdown_duration_hours: int = Field(
-        description="Duration of the longest drawdown period in hours"
+    max_drawdown_duration_candles: int = Field(
+        description="Duration of the longest drawdown period in candles"
     )
     sharpe_ratio: float = Field(
         description="Annualized Sharpe ratio (risk-free rate = 0)"

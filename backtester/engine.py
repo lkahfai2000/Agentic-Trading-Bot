@@ -32,6 +32,7 @@ def run_backtest(
     slippage_bps: float = 10.0,
     symbol: str = "BTC/USDT",
     strategy_name: str = "Unknown",
+    candles_per_year: int = 35_040,
 ) -> GradingReport:
     """Execute a fully vectorized backtest using Polars. No for-loops.
 
@@ -48,6 +49,8 @@ def run_backtest(
         slippage_bps: Slippage in basis points (10 = 0.1%).
         symbol: Trading pair name for the report.
         strategy_name: Strategy class name for the report.
+        candles_per_year: Number of candles per year for annualization
+            (35040 for 15m, 8760 for 1h).
 
     Returns:
         GradingReport with all metrics and failure narrative.
@@ -120,7 +123,7 @@ def run_backtest(
     total_return = final_equity - 1.0
 
     # CAGR
-    years = n_candles / 8760.0
+    years = n_candles / float(candles_per_year)
     if years > 0 and final_equity > 0:
         cagr = final_equity ** (1.0 / years) - 1.0
     else:
@@ -146,16 +149,16 @@ def run_backtest(
     else:
         max_dd_duration = 0
 
-    # Sharpe Ratio (annualized, hourly data → sqrt(8760))
+    # Sharpe Ratio (annualized)
     ret_mean = float(returns.mean()) if n_candles > 0 else 0.0
     ret_std = float(returns.std()) if n_candles > 1 else 0.0
-    sharpe = (ret_mean / ret_std * math.sqrt(8760)) if ret_std > 0 else 0.0
+    sharpe = (ret_mean / ret_std * math.sqrt(candles_per_year)) if ret_std > 0 else 0.0
 
     # Sortino Ratio (annualized, downside deviation)
     downside = returns.filter(returns < 0)
     if len(downside) > 1:
         downside_std = float(downside.std())
-        sortino = (ret_mean / downside_std * math.sqrt(8760)) if downside_std > 0 else 0.0
+        sortino = (ret_mean / downside_std * math.sqrt(candles_per_year)) if downside_std > 0 else 0.0
     else:
         sortino = 0.0
 
@@ -177,14 +180,14 @@ def run_backtest(
         "total_return": total_return,
         "total_trades": total_trades,
         "win_rate": win_rate,
-    })
+    }, candles_per_year=candles_per_year)
 
     return GradingReport(
         symbol=symbol,
         strategy_name=strategy_name,
         cagr=round(cagr, 6),
         max_drawdown=round(max_dd_magnitude, 6),
-        max_drawdown_duration_hours=max_dd_duration,
+        max_drawdown_duration_candles=max_dd_duration,
         sharpe_ratio=round(sharpe, 4),
         sortino_ratio=round(sortino, 4),
         win_rate=round(win_rate, 4),

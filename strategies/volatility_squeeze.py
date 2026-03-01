@@ -1,5 +1,8 @@
 """Volatility Squeeze Breakout Strategy — Convex Alpha Generator.
 
+Primary Timeframe: 15-minute candles (V5).
+All lookback parameters are scaled for 15m bars (4× the V1-V4 hourly values).
+
 Architectural Reasoning
 =======================
 
@@ -19,8 +22,7 @@ V2 Design (Convex Alpha Generator):
     1. RELEASE-START ENTRY RESTRICTION:
        Only enter on the FIRST bar of each squeeze release event, not on every
        qualifying bar during the release window. This prevents re-entry cycles
-       after stop-outs and reduces fee drag. Alone this improved CAGR from
-       +11.2% to +18.3% on seed=42.
+       after stop-outs and reduces fee drag.
 
     2. KELLY-LITE POSITION SIZING:
        Position size scales with squeeze intensity (how tight the BB were).
@@ -30,39 +32,28 @@ V2 Design (Convex Alpha Generator):
     3. ADX TREND MOMENTUM OVERLAY:
        ADX rising (vs N bars ago) → full position (momentum building).
        ADX falling → position halved (momentum fading, reduce exposure).
-       Uses Wilder EMA (ewm_mean with com=period-1) for proper smoothing.
-       Combined size range: [0.25, 1.0].
 
-    4. PROFIT-BASED STOP TIGHTENING (optional, disabled by default):
-       After price moves N*ATR in profit direction, tighten the ATR stop
-       multiplier. Disabled by default (be_atr_threshold=999) because
-       empirical testing showed it increases turnover without improving
-       risk-adjusted returns on hourly crypto data. Available for tuning.
+    4. PROFIT-BASED STOP TIGHTENING (optional, disabled by default).
 
 V3 Design (Dynamic Regime Switching):
     Two risk management overlays for production robustness:
 
     5. 2022 BEAR FILTER (Macro Regime Gate):
-       200-period 4h EMA (span=800 on 1h data). When close < EMA → bear regime.
+       200-period 4h EMA (span=3200 on 15m data). When close < EMA → bear regime.
        Position sizes reduced to bear_size_factor (default 8% of full size).
-       Stop tightening available but disabled by default (bear_stop_factor=1.0)
-       because empirical testing showed it increases turnover on hourly crypto data.
 
     6. FLASH CRASH CIRCUIT BREAKER:
-       When 1h ATR spikes > 3x its 1-week rolling average, flatten ALL positions.
-       Exits the "blast zone" before slippage becomes terminal. Applied as a
-       post-signal override (Phase 15) after all other logic completes.
+       When ATR spikes > 3x its 1-week rolling average, flatten ALL positions.
 
 V4 Design (Multi-Timeframe Sniper Entry):
-    One entry-timing overlay using 15m data:
-
     7. SNIPER ENTRY FILTER (Phase 8B):
-       When 15m OHLCV is provided (df_fast), gate all 1h squeeze-release
-       entries with a 15m EMA crossover confirmation. A bull entry requires
-       the 15m fast EMA (8 bars ≈ 2h) to cross above the slow EMA (32 bars
-       ≈ 8h) within that same hour. This filters false breakouts where
-       intra-hour price action does not confirm the 1h signal direction.
-       When df_fast is None, the filter is skipped (backward compatible).
+       When df_fast is provided (higher-timeframe data), gate entries with
+       EMA crossover confirmation. When df_fast is None, the filter is skipped.
+
+V5 Design (15-Minute Primary):
+    Switched primary timeframe from 1h to 15m for higher-frequency trading.
+    All lookback parameters rescaled by 4x to maintain identical time horizons.
+    Bridge runs cycles every 15 minutes instead of every hour.
 
 Measured Impact (seed=42):
     V1 → V2: CAGR +11.2% → +16.5%, DD -31.5% → -26.1%, Sharpe 0.46 → 0.64
@@ -86,25 +77,25 @@ class VolatilitySqueezeBreakout(Strategy):
 
     def __init__(
         self,
-        bb_period: int = 20,
+        bb_period: int = 80,
         bb_std: float = 2.0,
-        atr_period: int = 14,
-        squeeze_lookback: int = 240,
+        atr_period: int = 56,
+        squeeze_lookback: int = 960,
         squeeze_pctile: float = 0.10,
         atr_stop_mult: float = 3.5,
-        release_window: int = 3,
+        release_window: int = 12,
         candle_body_threshold: float = 0.30,
-        adx_period: int = 14,
+        adx_period: int = 56,
         adx_threshold: float = 25.0,
         adx_weak_factor: float = 0.5,
         be_atr_threshold: float = 999.0,
         be_stop_tighten: float = 0.5,
         # Regime-aware risk management (V3)
-        bear_ema_span: int = 800,
+        bear_ema_span: int = 3200,
         bear_size_factor: float = 0.08,
         bear_stop_factor: float = 1.0,
         cb_atr_mult: float = 3.0,
-        cb_atr_lookback: int = 168,
+        cb_atr_lookback: int = 672,
         # Multi-timeframe Sniper entry filter (V4)
         sniper_ema_fast: int = 8,
         sniper_ema_slow: int = 32,
@@ -176,7 +167,7 @@ class VolatilitySqueezeBreakout(Strategy):
         )
 
         # Phase 3B: 2022 Bear Filter — Macro Regime Check
-        # 200-period 4h EMA on 1h data = span of 800 bars
+        # 200-period 4h EMA = span of 3200 bars on 15m data
         bear_ema_com = (self.bear_ema_span - 1) / 2.0
 
         ind = ind.with_columns(
@@ -308,26 +299,26 @@ class VolatilitySqueezeBreakout(Strategy):
                 .alias("bear_cross_15m"),
             ])
 
-            # Truncate 15m timestamps to their containing 1h boundary
+            # Truncate fast timestamps to their containing primary boundary
             fast_ind = fast_ind.with_columns(
-                pl.col("timestamp").dt.truncate("1h").alias("hour_ts")
+                pl.col("timestamp").dt.truncate("1h").alias("group_ts")
             )
 
-            # Aggregate: did ANY 15m bar in this hour have a cross?
-            hourly_confirm = (
-                fast_ind.group_by("hour_ts")
+            # Aggregate: did ANY fast bar in this group have a cross?
+            group_confirm = (
+                fast_ind.group_by("group_ts")
                 .agg([
                     pl.col("bull_cross_15m").any().alias("bull_confirmed"),
                     pl.col("bear_cross_15m").any().alias("bear_confirmed"),
                 ])
-                .sort("hour_ts")
+                .sort("group_ts")
             )
 
-            # Join confirmation flags back to the 1h indicator DataFrame
+            # Join confirmation flags back to the primary indicator DataFrame
             ind = ind.join(
-                hourly_confirm,
+                group_confirm,
                 left_on="timestamp",
-                right_on="hour_ts",
+                right_on="group_ts",
                 how="left",
             ).with_columns([
                 pl.col("bull_confirmed").fill_null(False),

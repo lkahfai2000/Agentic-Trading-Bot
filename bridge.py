@@ -1,8 +1,8 @@
-"""Paper-trading bridge: V3 Convex Strategy -> Binance Testnet via CCXT.
+"""Paper-trading bridge: V5 Convex Strategy -> Binance Testnet via CCXT.
 
 Architecture
 ============
-The bridge is intentionally STATELESS. On every 1h cycle it:
+The bridge is intentionally STATELESS. On every 15m cycle it:
 
   1. Fetches the most recent OHLCV candles from Binance Testnet.
   2. Runs VolatilitySqueezeBreakout.generate_signals() to get the current
@@ -12,7 +12,7 @@ The bridge is intentionally STATELESS. On every 1h cycle it:
      max_account_exposure.
   5. Places a limit order and watches it for up to cancel_after_seconds.
      If unfilled, cancels and retries once with an aggressive price; otherwise
-     waits for the next 1h cycle.
+     waits for the next 15m cycle.
   6. Logs every decision in Dual-Track format: "Theoretical Signal" record
      alongside "Attempted Order" record with exact exchange error codes.
 
@@ -66,13 +66,13 @@ class BridgeConfig:
     symbol: str = "BTC/USDT"
     base_asset: str = "BTC"
     quote_asset: str = "USDT"
-    timeframe: str = "1h"
-    timeframe_fast: str = "15m"  # fast timeframe for Sniper entry filter
+    timeframe: str = "15m"
+    timeframe_fast: str = "1h"  # higher timeframe for optional sniper filter
 
-    # Candle lookback — needs warmup for EMA (bear_ema_span=800)
-    # + squeeze_lookback(240) + ATR warmup buffer
-    candle_lookback: int = 1100
-    candle_lookback_fast: int = 100  # 100 × 15m bars ≈ 25 hours
+    # Candle lookback — needs warmup for EMA (bear_ema_span=3200)
+    # + squeeze_lookback(960) + ATR warmup buffer
+    candle_lookback: int = 4400
+    candle_lookback_fast: int = 100  # 100 × 1h bars ≈ 4 days
 
     # Risk
     max_account_exposure: float = 0.95  # max fraction of USDT balance to risk
@@ -85,13 +85,13 @@ class BridgeConfig:
 
     # Health check
     max_consecutive_failures: int = 3  # failures before System Pause
-    cycle_interval_seconds: int = 3600  # 1h candle interval
+    cycle_interval_seconds: int = 900  # 15m candle interval
     health_poll_interval: int = 60  # sub-cycle health poll (seconds)
 
     # Regime detection params (must match strategy exactly)
-    bear_ema_com: float = 399.5  # (bear_ema_span - 1) / 2.0 where span=800
+    bear_ema_com: float = 1599.5  # (bear_ema_span - 1) / 2.0 where span=3200
     cb_atr_mult: float = 3.0
-    cb_atr_lookback: int = 168
+    cb_atr_lookback: int = 672
 
     # Logging
     log_dir: str = "./logs"
@@ -824,7 +824,7 @@ class TradingBridge:
     # -- Single cycle -------------------------------------------------------
 
     def _run_cycle(self) -> None:
-        """Execute one complete 1h cycle (fetch -> signal -> balance -> trade)."""
+        """Execute one complete 15m cycle (fetch -> signal -> balance -> trade)."""
         now = datetime.now(timezone.utc)
         self._log.new_cycle(now)
 
@@ -841,7 +841,7 @@ class TradingBridge:
             )
             return
 
-        # Step 1b: Fetch 15m data for Sniper confirmation (graceful degradation)
+        # Step 1b: Fetch higher-TF data for Sniper confirmation (graceful degradation)
         df_fast: pl.DataFrame | None = None
         try:
             df_fast = self._fetch_ohlcv_df(
@@ -850,7 +850,7 @@ class TradingBridge:
             )
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
             self._log.log_system_event(
-                "FETCH_15M_DEGRADED",
+                "FETCH_HTF_DEGRADED",
                 f"{type(e).__name__}: {e} — falling back to single-timeframe",
             )
 
@@ -1051,8 +1051,8 @@ class TradingBridge:
         if not self._cfg.dry_run:
             self._cancel_stale_orders()
 
-        # epoch_hour avoids day-boundary ambiguity of datetime.hour
-        last_epoch_hour = -1
+        # epoch_quarter avoids day-boundary ambiguity
+        last_epoch_quarter = -1
 
         try:
             while True:
@@ -1067,11 +1067,11 @@ class TradingBridge:
                         f"minutes). Exchange may be unreachable."
                     )
 
-                # Full trading cycle on epoch-hour boundary
-                epoch_hour = (
-                    int(datetime.now(timezone.utc).timestamp()) // 3600
+                # Full trading cycle on 15-minute boundary
+                epoch_quarter = (
+                    int(datetime.now(timezone.utc).timestamp()) // 900
                 )
-                if epoch_hour != last_epoch_hour:
+                if epoch_quarter != last_epoch_quarter:
                     try:
                         self._run_cycle()
                     except Exception as e:
@@ -1081,7 +1081,7 @@ class TradingBridge:
                             str(e),
                             {"type": type(e).__name__},
                         )
-                    last_epoch_hour = epoch_hour
+                    last_epoch_quarter = epoch_quarter
 
                 time.sleep(self._cfg.health_poll_interval)
         finally:

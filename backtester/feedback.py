@@ -7,6 +7,7 @@ def generate_failure_narrative(
     df: pl.DataFrame,
     bt: pl.DataFrame,
     metrics: dict,
+    candles_per_year: int = 35_040,
 ) -> str:
     """Generate a concise 2-sentence Failure Narrative analyzing strategy
     performance relative to market regimes.
@@ -43,7 +44,7 @@ def generate_failure_narrative(
         )
 
     # --- Regime classification (vectorized) ---
-    regime_info = _classify_market_regime(df)
+    regime_info = _classify_market_regime(df, candles_per_year=candles_per_year)
     dominant_regime = regime_info["dominant_regime"]
     regime_pcts = regime_info["regime_pcts"]
 
@@ -84,7 +85,10 @@ def generate_failure_narrative(
     return f"{sentence1} {sentence2}"
 
 
-def _classify_market_regime(df: pl.DataFrame) -> dict:
+def _classify_market_regime(
+    df: pl.DataFrame,
+    candles_per_year: int = 35_040,
+) -> dict:
     """Classify market into regime buckets using rolling metrics.
 
     Returns dict with:
@@ -92,7 +96,8 @@ def _classify_market_regime(df: pl.DataFrame) -> dict:
     - regime_pcts: dict[str, float] (fraction of time in each regime)
     - regime_series: pl.Series (per-candle regime label)
     """
-    window = 168  # 1 week in hours
+    # 1 week of candles: 672 for 15m, 168 for 1h
+    window = candles_per_year // 52
 
     # Compute all regime features and classification in a single select
     regime_df = df.select([
@@ -105,7 +110,7 @@ def _classify_market_regime(df: pl.DataFrame) -> dict:
             .fill_null(0.0)
             .rolling_std(window)
             .fill_null(0.0)
-            .mul(math.sqrt(8760))
+            .mul(math.sqrt(candles_per_year))
             .alias("rolling_vol"),
         # Directional consistency
         pl.col("close").pct_change()

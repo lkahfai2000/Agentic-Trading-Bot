@@ -50,7 +50,7 @@ from urllib.request import Request, urlopen
 # ---------------------------------------------------------------------------
 import audit as _audit  # import as module to avoid name collisions
 from alerts import TelegramAlerter
-from backtester.data import generate_mock_ohlcv, generate_mock_ohlcv_mtf
+from backtester.data import generate_mock_ohlcv, generate_mock_ohlcv_mtf  # noqa: F401
 from backtester.engine import run_backtest
 from backtester.schema import GradingReport
 from strategies.volatility_squeeze import VolatilitySqueezeBreakout
@@ -70,49 +70,51 @@ PROVING_GROUND_CACHE = Path("strategies/proving_ground_cache.json")
 
 # Exact literal strings from the volatility_squeeze.py __init__ signature.
 # Used by str.replace() to avoid float formatting ambiguity.
+# All lookback params scaled 4x for 15m primary timeframe.
 PARAM_SOURCE_STRINGS: dict[str, str] = {
-    "bb_period": "20",
+    "bb_period": "80",
     "bb_std": "2.0",
-    "atr_period": "14",
-    "squeeze_lookback": "240",
+    "atr_period": "56",
+    "squeeze_lookback": "960",
     "squeeze_pctile": "0.10",
     "atr_stop_mult": "3.5",
-    "release_window": "3",
+    "release_window": "12",
     "candle_body_threshold": "0.30",
-    "adx_period": "14",
+    "adx_period": "56",
     "adx_threshold": "25.0",
     "adx_weak_factor": "0.5",
     "be_atr_threshold": "999.0",
     "be_stop_tighten": "0.5",
-    "bear_ema_span": "800",
+    "bear_ema_span": "3200",
     "bear_size_factor": "0.08",
     "bear_stop_factor": "1.0",
     "cb_atr_mult": "3.0",
-    "cb_atr_lookback": "168",
+    "cb_atr_lookback": "672",
     "sniper_ema_fast": "8",
     "sniper_ema_slow": "32",
 }
 
 # Canonical production defaults — used to build full_params for each mutation
+# All lookback params scaled 4x for 15m primary timeframe.
 BASELINE_PARAMS: dict[str, Any] = {
-    "bb_period": 20,
+    "bb_period": 80,
     "bb_std": 2.0,
-    "atr_period": 14,
-    "squeeze_lookback": 240,
+    "atr_period": 56,
+    "squeeze_lookback": 960,
     "squeeze_pctile": 0.10,
     "atr_stop_mult": 3.5,
-    "release_window": 3,
+    "release_window": 12,
     "candle_body_threshold": 0.30,
-    "adx_period": 14,
+    "adx_period": 56,
     "adx_threshold": 25.0,
     "adx_weak_factor": 0.5,
     "be_atr_threshold": 999.0,
     "be_stop_tighten": 0.5,
-    "bear_ema_span": 800,
+    "bear_ema_span": 3200,
     "bear_size_factor": 0.08,
     "bear_stop_factor": 1.0,
     "cb_atr_mult": 3.0,
-    "cb_atr_lookback": 168,
+    "cb_atr_lookback": 672,
     "sniper_ema_fast": 8,
     "sniper_ema_slow": 32,
 }
@@ -291,17 +293,17 @@ _MUTATION_SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
         "Weak-trend fills drag performance — raise ADX 25→28 and lower weak factor 0.5→0.35",
         {"adx_threshold": 28.0, "adx_weak_factor": 0.35},
     ),
-    # MTF Sniper entry filter mutations
+    # Sniper entry filter mutations
     (
         "high_slippage",
         "TIGHTEN_SNIPER_EMA",
-        "High alpha leak — tighten 15m sniper slow EMA 32→20 for faster entry confirmation",
+        "High alpha leak — tighten sniper slow EMA 32→20 for faster entry confirmation",
         {"sniper_ema_slow": 20},
     ),
     (
         "weak_trend",
         "WIDEN_SNIPER_EMA",
-        "Weak-trend entries — widen 15m sniper slow EMA 32→48 to filter noise",
+        "Weak-trend entries — widen sniper slow EMA 32→48 to filter noise",
         {"sniper_ema_slow": 48},
     ),
     # Pad A & B — always available as fallbacks
@@ -332,13 +334,13 @@ _INCREMENTAL_SPECS: dict[str, list[tuple[str, float, float, float, str]]] = {
     "bear_regime": [
         ("bear_size_factor", 0.06, 0.02, 0.50,
          "Incremental: raise bear sizing {old}→{new} to capture more bear-market entries"),
-        ("bear_ema_span", -100, 200, 1200,
+        ("bear_ema_span", -400, 800, 4800,
          "Incremental: shorten bear EMA {old}→{new} for faster regime detection"),
     ],
     "cb_active": [
         ("cb_atr_mult", 0.5, 2.0, 6.0,
          "Incremental: raise CB threshold {old}→{new} to reduce false flattenings"),
-        ("cb_atr_lookback", 24, 72, 336,
+        ("cb_atr_lookback", 96, 288, 1344,
          "Incremental: lengthen CB lookback {old}→{new} for more stable baseline ATR"),
     ],
     "cancel_timeout": [
@@ -348,7 +350,7 @@ _INCREMENTAL_SPECS: dict[str, list[tuple[str, float, float, float, str]]] = {
     "pad_a": [
         ("bb_std", 0.2, 1.5, 3.5,
          "Incremental: widen BB std {old}→{new} to reduce whipsaw entries"),
-        ("bb_period", 5, 10, 50,
+        ("bb_period", 20, 40, 200,
          "Incremental: lengthen BB period {old}→{new} for smoother bands"),
     ],
     "pad_b": [
@@ -795,23 +797,23 @@ def propose_mutations(
 
 _LLM_SYSTEM_PROMPT = """\
 You are a quantitative strategy engineer specialising in Polars-based \
-vectorized trading signal generation for BTC/USDT data across multiple timeframes.
+vectorized trading signal generation for BTC/USDT on 15-minute candles.
 
 HARD RULES — violating ANY of these invalidates your output:
 1. Use ONLY Polars (import polars as pl). NEVER pandas, numpy for-loops, \
    .apply(), or .map_elements().
 2. The method signature MUST be exactly:
        def generate_signals(self, df: pl.DataFrame, df_fast: pl.DataFrame | None = None) -> pl.Series:
-   df is 1h OHLCV data. df_fast is 15m OHLCV data (may be None).
-3. df and df_fast have: timestamp, open, high, low, close, volume (all Float64). \
+   df is 15m OHLCV data (primary timeframe). df_fast is optional higher-TF data (may be None).
+3. df has: timestamp, open, high, low, close, volume (all Float64). \
    The method adds computed columns (bb_mid, bb_upper, bb_lower, bb_std_val, \
    true_range, atr, bbw, atr_baseline, atr_spike_ratio, cb_active, etc.). \
    If you reference a column, you MUST ensure it is computed in a prior phase.
-4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df (the 1h frame). \
+4. Return a pl.Series of Float64 in [-1.0, 1.0], same length as df. \
    Use .clip(-1.0, 1.0) on the final signal to guarantee this.
 5. Reference ONLY self.xxx attributes defined in the existing __init__. \
-   Do NOT add new constructor parameters. Available MTF attributes: \
-   self.sniper_ema_fast (int), self.sniper_ema_slow (int).
+   Do NOT add new constructor parameters. All lookback params are already \
+   scaled for 15m bars (e.g., bb_period=80, atr_period=56, bear_ema_span=3200).
 6. Preserve the existing 15-phase architecture. Add or modify phases — \
    do NOT delete existing phases unless replacing their purpose.
 7. Polars API gotchas: \
@@ -819,9 +821,9 @@ HARD RULES — violating ANY of these invalidates your output:
    - Use .ewm_mean() NOT .ewm().mean(). \
    - Use pl.col("x").rolling_mean(window_size=N) NOT .rolling(N).mean(). \
    - Use .shift(n) NOT .shift(periods=n).
-8. When using df_fast, aggregate 15m data to 1h using \
-   pl.col("timestamp").dt.truncate("1h") as group key before joining to \
-   the 1h indicator DataFrame. The output must be the same length as df.
+8. df_fast is optional higher-timeframe data. When provided, aggregate it \
+   before joining to the primary indicator DataFrame. The output must be \
+   the same length as df.
 """
 
 _LLM_USER_TEMPLATE = """\
@@ -833,15 +835,10 @@ _LLM_USER_TEMPLATE = """\
 - Filled orders: {filled}    Cancelled: {cancelled}
 - Stuck orders (>60s): {stuck}
 
-## Multi-Timeframe Architecture
-The strategy uses two timeframes:
-- 1h (df): Trend direction, squeeze detection, regime classification
-- 15m (df_fast): Entry timing via EMA crossover confirmation (Sniper Rule)
-
-The current 15m entry filter (Phase 8B) uses a dual-EMA crossover gate: \
-fast EMA(8) crossing above/below slow EMA(32) on 15m data. This filters \
-1h entries that lack intra-hour price confirmation. Alpha leakage of \
-{mean_slip:.2f} bps suggests the 15m filter may need structural improvement.
+## Timeframe Architecture
+Primary timeframe: 15-minute candles.
+All lookback parameters are scaled for 15m bars (e.g., bb_period=80, atr_period=56).
+Optional higher-timeframe data (df_fast) can provide trend confirmation.
 
 ## Failure Narrative (last 24h)
 {narrative}
@@ -853,14 +850,14 @@ fast EMA(8) crossing above/below slow EMA(32) on 15m data. This filters \
 
 ## Task
 Diagnose the primary failure mode visible in the metrics and narrative, \
-then propose ONE structural change to the 15m entry filter logic (Phase 8B). \
+then propose ONE structural change to the signal generation logic. \
 This must be a logic shift, NOT a parameter tweak. Examples of valid changes:
-  - Replace simple EMA cross with volume-weighted VWAP confirmation on 15m
-  - Add a 15m RSI divergence filter rejecting entries when momentum diverges
-  - Add a 15m ATR contraction gate that waits for volatility to compress
-  - Use 15m order-flow imbalance (buy vs sell volume) to confirm direction
-  - Add a 15m higher-high/higher-low structure confirmation for long entries
-  - Replace Phase 8B with a 15m Bollinger Band squeeze-within-squeeze filter
+  - Add a volume-weighted VWAP confirmation filter
+  - Add an RSI divergence filter rejecting entries when momentum diverges
+  - Add an ATR contraction gate that waits for volatility to compress
+  - Use order-flow imbalance (buy vs sell volume) to confirm direction
+  - Add a higher-high/higher-low structure confirmation for long entries
+  - Add a Bollinger Band squeeze-within-squeeze filter
 
 ## Output Format (STRICT — follow exactly)
 DIAGNOSIS: <2-3 sentences explaining the primary failure mode>
@@ -1080,11 +1077,13 @@ def get_llm_mutation(
     print("  Gate 1 ✓  compile()")
 
     # Gates 2-5: exec + instantiate + generate + validate
-    # Use MTF dataset matching the Proving Ground (seed=42, 8760 hours) so that
+    # Use 15m dataset matching the Proving Ground (seed=42, 8760 hours) so that
     # signals which pass here won't fail the full backtest on a different distribution.
-    smoke_df, smoke_df_fast = generate_mock_ohlcv_mtf(symbol="BTC/USDT", hours=8760, seed=42)
+    smoke_df = generate_mock_ohlcv(
+        symbol="BTC/USDT", hours=8760, seed=42, timeframe_minutes=15,
+    )
     try:
-        _exec_and_generate(full_source, smoke_df, df_fast=smoke_df_fast)
+        _exec_and_generate(full_source, smoke_df)
     except Exception as e:
         print(f"  Gate 2-5 FAIL — exec/generate: {e}")
         return None
@@ -1106,10 +1105,12 @@ def _run_llm_backtest(
     friction_bps: float,
 ) -> Optional[MutationResult]:
     """Run the LLM mutation through the full Proving Ground backtest."""
-    df, df_fast = generate_mock_ohlcv_mtf(symbol="BTC/USDT", hours=8760, seed=42)
+    df = generate_mock_ohlcv(
+        symbol="BTC/USDT", hours=8760, seed=42, timeframe_minutes=15,
+    )
 
     try:
-        signals = _exec_and_generate(candidate.llm_source, df, df_fast=df_fast)
+        signals = _exec_and_generate(candidate.llm_source, df)
     except Exception as e:
         print(f"  LLM backtest runtime error: {e}")
         return None
@@ -1122,6 +1123,7 @@ def _run_llm_backtest(
         slippage_bps=friction_bps,
         symbol="BTC/USDT",
         strategy_name="LLM_STRUCTURAL",
+        candles_per_year=35_040,
     )
 
     base_sharpe = baseline_report.sharpe_ratio
@@ -1156,18 +1158,22 @@ def run_proving_ground(
     baseline matches actual production.
     """
     base = current_params if current_params is not None else BASELINE_PARAMS
-    df, df_fast = generate_mock_ohlcv_mtf(symbol="BTC/USDT", hours=8760, seed=42)
+    # Generate 15m data (primary timeframe) for the proving ground
+    df = generate_mock_ohlcv(
+        symbol="BTC/USDT", hours=8760, seed=42, timeframe_minutes=15,
+    )
 
     # Baseline — use current production params, not hardcoded originals
     baseline_strategy = VolatilitySqueezeBreakout(**base)
     baseline_report = run_backtest(
         df=df,
-        signals=baseline_strategy.generate_signals(df, df_fast=df_fast),
+        signals=baseline_strategy.generate_signals(df),
         init_cash=10_000.0,
         fee_bps=10.0,
         slippage_bps=friction_bps,
         symbol="BTC/USDT",
         strategy_name="BASELINE",
+        candles_per_year=35_040,
     )
 
     baseline_result = MutationResult(
@@ -1185,12 +1191,13 @@ def run_proving_ground(
         strategy = VolatilitySqueezeBreakout(**m.full_params)
         report = run_backtest(
             df=df,
-            signals=strategy.generate_signals(df, df_fast=df_fast),
+            signals=strategy.generate_signals(df),
             init_cash=10_000.0,
             fee_bps=10.0,
             slippage_bps=friction_bps,
             symbol="BTC/USDT",
             strategy_name=m.name,
+            candles_per_year=35_040,
         )
 
         base_sharpe = baseline_report.sharpe_ratio

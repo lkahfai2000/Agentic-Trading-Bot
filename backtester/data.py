@@ -41,8 +41,9 @@ def generate_mock_ohlcv(
     hours: int = 8760,
     start_price: float | None = None,
     seed: int = 42,
+    timeframe_minutes: int = 15,
 ) -> pl.DataFrame:
-    """Generate synthetic 1h OHLCV data using geometric Brownian motion.
+    """Generate synthetic OHLCV data using geometric Brownian motion.
 
     Produces crypto-like price action with realistic volatility:
     - BTC: ~60% annualized vol, default start $40,000
@@ -50,9 +51,10 @@ def generate_mock_ohlcv(
 
     Args:
         symbol: Trading pair name (used to set default price/vol).
-        hours: Number of hourly candles to generate.
+        hours: Duration of the generated dataset in hours.
         start_price: Override starting price. Auto-detected from symbol if None.
         seed: Random seed for reproducibility.
+        timeframe_minutes: Candle interval in minutes (15 for 15m, 60 for 1h).
 
     Returns:
         Polars DataFrame with columns: timestamp, open, high, low, close, volume.
@@ -75,19 +77,20 @@ def generate_mock_ohlcv(
     else:
         annual_vol = 0.50
 
-    # GBM parameters (hourly)
-    dt = 1.0 / 8760.0  # fraction of a year per hour
+    # GBM parameters (timeframe-aware)
+    n_bars = hours * 60 // timeframe_minutes
+    dt = timeframe_minutes / (8760.0 * 60.0)  # fraction of a year per bar
     mu = 0.0  # drift-neutral for unbiased mock data
     sigma = annual_vol
 
     # Generate log-returns
-    log_returns = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * rng.standard_normal(hours)
+    log_returns = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * rng.standard_normal(n_bars)
 
     # Build close prices from cumulative returns
     close_prices = start_price * np.exp(np.cumsum(log_returns))
 
     # Open = previous close (first open = start_price)
-    open_prices = np.empty(hours)
+    open_prices = np.empty(n_bars)
     open_prices[0] = start_price
     open_prices[1:] = close_prices[:-1]
 
@@ -104,12 +107,12 @@ def generate_mock_ohlcv(
     abs_returns = np.abs(log_returns)
     base_volume = 1000.0 * start_price  # notional-scaled
     volume = base_volume * np.exp(
-        rng.normal(0, 0.5, hours) + 2.0 * abs_returns / abs_returns.mean()
+        rng.normal(0, 0.5, n_bars) + 2.0 * abs_returns / abs_returns.mean()
     )
 
-    # Timestamps: hourly from 2024-01-01
+    # Timestamps
     start_ts = datetime(2024, 1, 1)
-    timestamps = [start_ts + timedelta(hours=i) for i in range(hours)]
+    timestamps = [start_ts + timedelta(minutes=timeframe_minutes * i) for i in range(n_bars)]
 
     return pl.DataFrame({
         "timestamp": timestamps,

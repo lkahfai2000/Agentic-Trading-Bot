@@ -26,6 +26,7 @@ def run_strategy(
     df,
     symbol: str = "BTC/USDT",
     df_fast: pl.DataFrame | None = None,
+    candles_per_year: int = 35_040,
 ) -> dict:
     """Run a single strategy through the Proving Ground and return results."""
     t0 = time.perf_counter()
@@ -38,6 +39,7 @@ def run_strategy(
         slippage_bps=10.0,
         symbol=symbol,
         strategy_name=strategy.__class__.__name__,
+        candles_per_year=candles_per_year,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return {"report": report, "elapsed_ms": elapsed_ms}
@@ -87,8 +89,8 @@ def run_walkforward(
 def main() -> None:
     target = sys.argv[1] if len(sys.argv) > 1 else "all"
 
-    # Generate shared dataset (same seed = same market for fair comparison)
-    df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42)
+    # Generate shared dataset (15m candles, same seed = same market for fair comparison)
+    df = generate_mock_ohlcv(symbol="BTC/USDT", hours=8760, seed=42, timeframe_minutes=15)
 
     if target == "walkforward":
         results = run_walkforward(df)
@@ -97,7 +99,7 @@ def main() -> None:
         return
 
     if target == "mtf":
-        # Multi-timeframe comparison: squeeze without vs with 15m sniper filter
+        # Multi-timeframe comparison: 15m standalone vs 15m + 1h sniper filter
         df_1h, df_15m = generate_mock_ohlcv_mtf(
             symbol="BTC/USDT", hours=8760, seed=42
         )
@@ -105,34 +107,34 @@ def main() -> None:
 
         print("=== MTF Comparison (seed=42) ===", file=sys.stderr)
 
-        # Baseline: 1h only (no sniper filter)
-        r_1h = run_strategy(strategy, df_1h)
-        rep = r_1h["report"]
-        print(f"\n  [1h Only]:", file=sys.stderr)
+        # Baseline: 15m only (no sniper filter)
+        r_15m = run_strategy(strategy, df_15m)
+        rep = r_15m["report"]
+        print(f"\n  [15m Only]:", file=sys.stderr)
         print(f"    CAGR:     {rep.cagr*100:+.1f}%", file=sys.stderr)
         print(f"    Max DD:   {rep.max_drawdown*100:.1f}%", file=sys.stderr)
         print(f"    Sharpe:   {rep.sharpe_ratio:+.2f}", file=sys.stderr)
         print(f"    Trades:   {rep.total_trades}", file=sys.stderr)
         print(f"    Win Rate: {rep.win_rate:.0%}", file=sys.stderr)
-        print(f"    Time:     {r_1h['elapsed_ms']:.1f}ms", file=sys.stderr)
-        print(f"    Sniper:   OFF (1h only)", file=sys.stderr)
+        print(f"    Time:     {r_15m['elapsed_ms']:.1f}ms", file=sys.stderr)
+        print(f"    Sniper:   OFF (15m only)", file=sys.stderr)
 
-        # MTF: 1h + 15m sniper filter
-        r_mtf = run_strategy(strategy, df_1h, df_fast=df_15m)
+        # MTF: 15m + 1h sniper filter
+        r_mtf = run_strategy(strategy, df_15m, df_fast=df_1h)
         rep = r_mtf["report"]
         sniper = getattr(strategy, "_sniper_meta", {})
-        print(f"\n  [1h + 15m Sniper]:", file=sys.stderr)
+        print(f"\n  [15m + 1h Sniper]:", file=sys.stderr)
         print(f"    CAGR:     {rep.cagr*100:+.1f}%", file=sys.stderr)
         print(f"    Max DD:   {rep.max_drawdown*100:.1f}%", file=sys.stderr)
         print(f"    Sharpe:   {rep.sharpe_ratio:+.2f}", file=sys.stderr)
         print(f"    Trades:   {rep.total_trades}", file=sys.stderr)
         print(f"    Win Rate: {rep.win_rate:.0%}", file=sys.stderr)
         print(f"    Time:     {r_mtf['elapsed_ms']:.1f}ms", file=sys.stderr)
-        print(f"    Sniper:   {sniper.get('entries_gated', 0)} entries gated by 15m filter", file=sys.stderr)
+        print(f"    Sniper:   {sniper.get('entries_gated', 0)} entries gated by 1h filter", file=sys.stderr)
 
         output = [
-            {**r_1h["report"].model_dump(), "strategy_name": "Squeeze_1h_Only"},
-            {**r_mtf["report"].model_dump(), "strategy_name": "Squeeze_1h+15m_Sniper"},
+            {**r_15m["report"].model_dump(), "strategy_name": "Squeeze_15m_Only"},
+            {**r_mtf["report"].model_dump(), "strategy_name": "Squeeze_15m+1h_Sniper"},
         ]
         print(json.dumps(output, indent=2))
         return
