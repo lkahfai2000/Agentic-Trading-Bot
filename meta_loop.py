@@ -6,7 +6,7 @@ and Proving Ground backtester into a single automated pipeline.
 Pipeline:
   1. Ingest audit.py results → measure real slippage vs 10bps assumption
   2. Update bridge_override.json if alpha leakage exceeds threshold
-  3. Parse last 24h of JSONL logs → generate failure narrative
+  3. Parse last 180d of JSONL logs → generate failure narrative
   4. Propose 3 parameter mutations targeted at the top failure modes
   4b. (Optional) LLM Consultant proposes one structural code mutation
   5. Run baseline + mutations through the Proving Ground at 15bps friction
@@ -482,7 +482,7 @@ def build_failure_stats(log_dir: str, lookback_hours: int = 24) -> FailureStats:
 
     parsed = _audit.classify_events(all_records)
 
-    # Filter THEORETICAL records to last 24h
+    # Filter THEORETICAL records to lookback window
     recent_theo = [
         r for r in parsed.theoretical.values()
         if _parse_ts(r.ts) >= cutoff
@@ -584,7 +584,7 @@ def _build_narrative(
     parts: list[str] = []
 
     if total_cycles == 0:
-        return "No trading cycles found in the last 24 hours."
+        return "No trading cycles found in the lookback window."
 
     if cb_active > 0:
         pct = cb_active / total_cycles * 100
@@ -616,7 +616,7 @@ def _build_narrative(
 
     if not parts:
         parts.append(
-            "No significant failure modes detected in the last 24 hours. "
+            "No significant failure modes detected in the lookback window. "
             "Applying best-practice parameter improvements."
         )
 
@@ -792,10 +792,82 @@ def propose_mutations(
 
 
 # ===================================================================
-# Phase 4b: LLM Consultant (structural code mutation)
+# Phase 4b: LLM Consultant (parameter-only mutations)
 # ===================================================================
 
 _LLM_SYSTEM_PROMPT = """\
+You are a quantitative strategy parameter tuner for a BTC/USDT \
+Volatility Squeeze Breakout strategy running on 15-minute candles.
+
+Your job: analyse execution audit metrics and failure narratives, \
+then recommend PARAMETER changes only. You must NOT rewrite code. \
+You must NOT propose structural changes or new indicators.
+
+HARD RULES:
+1. You may ONLY recommend changes to existing constructor parameters.
+2. Do NOT propose new parameters, new indicators, or code rewrites.
+3. Provide your recommendations as a JSON object mapping parameter \
+   names to new numeric values.
+4. Each recommendation must include a rationale tied to the failure data.
+5. Recommend between 1 and 3 parameter changes per response.
+6. All parameter values must be numeric (int or float).
+
+Available parameters and their current defaults:
+  bb_period: int = 80         (Bollinger Band lookback)
+  bb_std: float = 2.0         (BB standard deviation multiplier)
+  atr_period: int = 56        (ATR lookback)
+  squeeze_lookback: int = 960  (BBW ranking window)
+  squeeze_pctile: float = 0.10 (BBW percentile for squeeze detection)
+  atr_stop_mult: float = 3.5  (ATR stop-loss multiplier)
+  release_window: int = 12    (squeeze release lookback)
+  candle_body_threshold: float = 0.30  (momentum candle threshold)
+  adx_period: int = 56        (ADX lookback)
+  adx_threshold: float = 25.0 (ADX trend confirmation level)
+  adx_weak_factor: float = 0.5 (position scale when ADX declining)
+  be_atr_threshold: float = 999.0 (profit ATR for stop tightening)
+  be_stop_tighten: float = 0.5 (stop tightening factor)
+  bear_ema_span: int = 3200   (bear regime EMA span)
+  bear_size_factor: float = 0.08 (position scale in bear regime)
+  bear_stop_factor: float = 1.0 (stop factor in bear regime)
+  cb_atr_mult: float = 3.0    (circuit breaker ATR threshold)
+  cb_atr_lookback: int = 672   (circuit breaker baseline window)
+  sniper_ema_fast: int = 8    (sniper fast EMA)
+  sniper_ema_slow: int = 32   (sniper slow EMA)
+"""
+
+_LLM_USER_TEMPLATE = """\
+## Current Audit Metrics
+- Mean slippage: {mean_slip:.2f} bps (alpha leak — target: reduce below 10 bps)
+- Median slippage: {median_slip:.2f} bps
+- P95 fill time: {p95_time:.1f}s
+- Mean fill time: {mean_time:.1f}s
+- Filled orders: {filled}    Cancelled: {cancelled}
+- Stuck orders (>60s): {stuck}
+
+## Failure Narrative (last 180d)
+{narrative}
+
+## Current Parameter Values
+{current_params_str}
+
+## Task
+Analyse the failure modes in the metrics and narrative. Recommend \
+parameter changes that address the top failure mode(s). Explain your \
+reasoning for each change. Do NOT suggest code changes.
+
+## Output Format (STRICT — follow exactly)
+DIAGNOSIS: <2-3 sentences explaining the primary failure mode>
+
+PARAMS:
+```json
+{{"param_name": new_value, "param_name2": new_value2}}
+```
+
+RATIONALE: <1-2 sentences per parameter explaining why this change helps>
+"""
+
+# Preserved for shadow_lab.py — unrestricted structural mutation prompts
+_SHADOW_LLM_SYSTEM_PROMPT = """\
 You are a quantitative strategy engineer specialising in Polars-based \
 vectorized trading signal generation for BTC/USDT on 15-minute candles.
 
@@ -826,21 +898,12 @@ HARD RULES — violating ANY of these invalidates your output:
    the same length as df.
 """
 
-_LLM_USER_TEMPLATE = """\
+_SHADOW_LLM_USER_TEMPLATE = """\
 ## Current Audit Metrics
-- Mean slippage: {mean_slip:.2f} bps (alpha leak — target: reduce below 10 bps)
-- Median slippage: {median_slip:.2f} bps
-- P95 fill time: {p95_time:.1f}s
-- Mean fill time: {mean_time:.1f}s
+- Mean slippage: {mean_slip:.2f} bps
 - Filled orders: {filled}    Cancelled: {cancelled}
-- Stuck orders (>60s): {stuck}
 
-## Timeframe Architecture
-Primary timeframe: 15-minute candles.
-All lookback parameters are scaled for 15m bars (e.g., bb_period=80, atr_period=56).
-Optional higher-timeframe data (df_fast) can provide trend confirmation.
-
-## Failure Narrative (last 24h)
+## Failure Narrative
 {narrative}
 
 ## Current generate_signals Method
@@ -914,31 +977,42 @@ def _extract_generate_signals(source: str) -> str:
     return source[idx:]
 
 
-def _parse_llm_response(response: str) -> tuple[str, str, Optional[str]]:
-    """Parse diagnosis, change description, and code block from LLM response.
+def _parse_llm_response(response: str) -> tuple[str, str, Optional[dict[str, Any]]]:
+    """Parse diagnosis, rationale, and parameter recommendations from LLM response.
 
-    Returns (diagnosis, change_description, code_or_None).
+    Returns (diagnosis, rationale, param_dict_or_None).
     """
     # Extract diagnosis
-    diag_match = re.search(r"DIAGNOSIS:\s*(.+?)(?=\nCHANGE:|\n```)", response, re.DOTALL)
+    diag_match = re.search(r"DIAGNOSIS:\s*(.+?)(?=\nPARAMS:|\nRATIONALE:|\n```)", response, re.DOTALL)
     diagnosis = diag_match.group(1).strip() if diag_match else "No diagnosis provided."
 
-    # Extract change description
-    change_match = re.search(r"CHANGE:\s*(.+?)(?=\n```|\n\n)", response, re.DOTALL)
-    description = change_match.group(1).strip() if change_match else "No description provided."
+    # Extract rationale
+    rat_match = re.search(r"RATIONALE:\s*(.+?)$", response, re.DOTALL)
+    rationale = rat_match.group(1).strip() if rat_match else "No rationale provided."
 
-    # Extract Python code block
-    code_match = re.search(r"```python\s*\n(.*?)```", response, re.DOTALL)
-    if not code_match:
-        return diagnosis, description, None
+    # Extract JSON code block
+    json_match = re.search(r"```json\s*\n(.*?)```", response, re.DOTALL)
+    if not json_match:
+        return diagnosis, rationale, None
 
-    code = code_match.group(1)
+    try:
+        params = json.loads(json_match.group(1))
+    except json.JSONDecodeError:
+        return diagnosis, rationale, None
 
-    # Verify the code contains the expected method signature
-    if "def generate_signals" not in code:
-        return diagnosis, description, None
+    if not isinstance(params, dict):
+        return diagnosis, rationale, None
 
-    return diagnosis, description, code
+    # Validate all keys are known parameters with numeric values
+    valid_params: dict[str, Any] = {}
+    for k, v in params.items():
+        if k in BASELINE_PARAMS and isinstance(v, (int, float)):
+            valid_params[k] = type(BASELINE_PARAMS[k])(v)
+
+    if not valid_params:
+        return diagnosis, rationale, None
+
+    return diagnosis, rationale, valid_params
 
 
 def _splice_method(original_source: str, new_method: str) -> str:
@@ -998,17 +1072,15 @@ def get_llm_mutation(
     metrics: AuditMetrics,
     stats: FailureStats,
     model: str = "claude-sonnet-4-20250514",
+    current_params: dict[str, Any] | None = None,
 ) -> Optional[MutationCandidate]:
-    """Phase 4b orchestrator: call LLM for a structural mutation proposal.
+    """Phase 4b orchestrator: call LLM for parameter recommendations.
 
-    Safe-Solder Protocol — 5 validation gates:
-      1. compile() — syntax check
-      2. exec() — import resolution
-      3. Instantiation — no missing constructor args
-      4. Signal shape — len(signals) == len(df)
-      5. Signal range — all values in [-1.0, 1.0]
+    Production lockdown: the LLM only recommends parameter changes, not
+    code rewrites.  The candidate goes through the standard deterministic
+    hot-swap path (regex-based constructor default replacement).
 
-    Returns MutationCandidate(is_llm=True) or None on any failure.
+    Returns MutationCandidate or None on any failure.
     All failures are non-fatal — the deterministic path continues.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -1016,13 +1088,12 @@ def get_llm_mutation(
         print("  ANTHROPIC_API_KEY not set — skipping LLM mutation.")
         return None
 
-    # Read current strategy source
-    strategy_source = STRATEGY_FILE.read_text(encoding="utf-8")
-    try:
-        method_source = _extract_generate_signals(strategy_source)
-    except ValueError as e:
-        print(f"  Cannot extract generate_signals: {e}")
-        return None
+    base = current_params if current_params is not None else dict(BASELINE_PARAMS)
+
+    # Format current params for the prompt
+    current_params_str = "\n".join(
+        f"  {k}: {v}" for k, v in sorted(base.items())
+    )
 
     # Build prompt
     user_prompt = _LLM_USER_TEMPLATE.format(
@@ -1034,7 +1105,7 @@ def get_llm_mutation(
         cancelled=metrics.cancelled_count,
         stuck=metrics.stuck_count,
         narrative=stats.narrative,
-        method_source=method_source,
+        current_params_str=current_params_str,
     )
 
     # Persist full prompt for dashboard "Brain Audit" viewer
@@ -1053,49 +1124,31 @@ def get_llm_mutation(
         return None
 
     # Parse response
-    diagnosis, description, code = _parse_llm_response(response)
+    diagnosis, rationale, param_dict = _parse_llm_response(response)
     print(f"  Diagnosis: {diagnosis[:120]}...")
-    print(f"  Change:    {description[:120]}")
 
-    if code is None:
-        print("  No valid Python code block in LLM response — skipping.")
+    if param_dict is None:
+        print("  No valid parameter recommendations in LLM response — skipping.")
         return None
 
-    # Splice into full file source
-    try:
-        full_source = _splice_method(strategy_source, code)
-    except ValueError as e:
-        print(f"  Splice failed: {e}")
+    # Filter out no-op params (same as current value)
+    effective = {k: v for k, v in param_dict.items() if base.get(k) != v}
+    if not effective:
+        print("  LLM recommended current values (no-op) — skipping.")
         return None
 
-    # Gate 1: compile()
-    try:
-        compile(full_source, "volatility_squeeze_llm.py", "exec")
-    except SyntaxError as e:
-        print(f"  Gate 1 FAIL — compile(): {e}")
-        return None
-    print("  Gate 1 ✓  compile()")
+    changes_str = ", ".join(f"{k}: {base.get(k)} -> {v}" for k, v in effective.items())
+    print(f"  Params:    {changes_str}")
+    print(f"  Rationale: {rationale[:200]}")
 
-    # Gates 2-5: exec + instantiate + generate + validate
-    # Use 15m dataset matching the Proving Ground (seed=42, 8760 hours) so that
-    # signals which pass here won't fail the full backtest on a different distribution.
-    smoke_df = generate_mock_ohlcv(
-        symbol="BTC/USDT", hours=8760, seed=42, timeframe_minutes=15,
-    )
-    try:
-        _exec_and_generate(full_source, smoke_df)
-    except Exception as e:
-        print(f"  Gate 2-5 FAIL — exec/generate: {e}")
-        return None
-    print("  Gate 2 ✓  exec()  |  Gate 3 ✓  instantiate  |  Gate 4 ✓  shape  |  Gate 5 ✓  range")
-
+    full_params = {**base, **effective}
     return MutationCandidate(
-        name="LLM_STRUCTURAL",
-        rationale=f"{diagnosis} => {description}",
-        param_changes={},
-        full_params={},
+        name="LLM_PARAMETER",
+        rationale=f"{diagnosis} => {rationale}",
+        param_changes=effective,
+        full_params=full_params,
         is_llm=True,
-        llm_source=full_source,
+        llm_source=None,
     )
 
 
@@ -1515,8 +1568,8 @@ def main() -> None:
         # -----------------------------------------------------------------
         # Phase 3: Failure narrative
         # -----------------------------------------------------------------
-        print("[3/6] FAILURE NARRATIVE  (last 24h)")
-        stats = build_failure_stats(args.log_dir, lookback_hours=24)
+        print("[3/6] FAILURE NARRATIVE  (last 180d)")
+        stats = build_failure_stats(args.log_dir, lookback_hours=4320)
         _print_failure_stats(stats)
         print()
 
@@ -1567,15 +1620,21 @@ def main() -> None:
         llm_candidate = None
         if args.enable_llm:
             print(f"[4b/6] LLM CONSULTANT  ({args.llm_model})")
-            llm_candidate = get_llm_mutation(metrics, stats, model=args.llm_model)
+            llm_candidate = get_llm_mutation(
+                metrics, stats, model=args.llm_model,
+                current_params=current_params,
+            )
             if llm_candidate is None:
                 print("  LLM mutation: not available (see above).")
+            else:
+                mutations.append(llm_candidate)
             print()
 
         # -----------------------------------------------------------------
         # Phase 5: Proving Ground
         # -----------------------------------------------------------------
-        if deterministic_cached and llm_candidate is None:
+        has_llm = llm_candidate is not None
+        if deterministic_cached and not has_llm:
             # Nothing new to test — skip proving ground entirely
             print(f"[5/6] PROVING GROUND  (skipped — deterministic cached, no LLM candidate)")
             print()
@@ -1585,21 +1644,8 @@ def main() -> None:
         else:
             print(f"[5/6] PROVING GROUND  (slippage_bps={args.friction_bps})")
 
-            if deterministic_cached:
-                # Only run baseline + LLM (skip redundant deterministic backtests)
-                print("  Deterministic mutations cached — running baseline + LLM only.")
-                results = run_proving_ground([], friction_bps=args.friction_bps, current_params=current_params)
-            else:
-                results = run_proving_ground(mutations, friction_bps=args.friction_bps, current_params=current_params)
-
-            # Phase 5b: LLM backtest (append to results if available)
-            if llm_candidate is not None:
-                baseline_report = results[0].report
-                llm_result = _run_llm_backtest(llm_candidate, baseline_report, args.friction_bps)
-                if llm_result is not None:
-                    results.append(llm_result)
-                else:
-                    print("  LLM mutation failed full backtest — excluded from ranking.")
+            # LLM param mutations are already appended to `mutations` list above
+            results = run_proving_ground(mutations, friction_bps=args.friction_bps, current_params=current_params)
 
             _print_comparison_table(results)
             print()
@@ -1620,9 +1666,9 @@ def main() -> None:
             alerter = TelegramAlerter()
             baseline = results[0]
             if winner.candidate.is_llm:
-                # LLM mutation: show rationale instead of param changes
+                # LLM mutation: show rationale and param changes
                 param_changes_for_alert = {
-                    "type": ("deterministic", "LLM structural"),
+                    "type": ("deterministic", "LLM parameter"),
                     "change": ("—", winner.candidate.rationale[:80]),
                 }
             else:

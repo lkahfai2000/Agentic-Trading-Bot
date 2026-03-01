@@ -54,6 +54,50 @@ from strategies.volatility_squeeze import VolatilitySqueezeBreakout
 
 
 # ---------------------------------------------------------------------------
+# Exponential backoff for transient CCXT errors
+# ---------------------------------------------------------------------------
+
+# Transient errors worth retrying (server-side / network)
+_TRANSIENT_CCXT_ERRORS = (
+    ccxt.NetworkError,
+    ccxt.RateLimitExceeded,
+)
+
+# Permanent errors — raise immediately, never retry
+_PERMANENT_CCXT_ERRORS = (
+    ccxt.InsufficientFunds,
+    ccxt.InvalidOrder,
+    ccxt.AuthenticationError,
+)
+
+_retry_log = logging.getLogger("bridge.retry")
+
+
+def _retry_transient(fn, max_retries: int = 3, base_delay: float = 2.0):
+    """Call fn(), retry on transient CCXT errors with exponential backoff.
+
+    Delays: 2s, 4s, 8s.  Permanent errors (InsufficientFunds, InvalidOrder,
+    AuthenticationError) are raised immediately without retry.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except _PERMANENT_CCXT_ERRORS:
+            raise
+        except _TRANSIENT_CCXT_ERRORS as e:
+            last_exc = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                _retry_log.warning(
+                    "[RETRY %d/%d] %s — retrying in %.1fs",
+                    attempt + 1, max_retries, e, delay,
+                )
+                time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -394,34 +438,48 @@ class BinanceTestnetClient:
         self, symbol: str, timeframe: str, limit: int
     ) -> list[list]:
         """Fetch recent OHLCV candles. Returns [[ts_ms, O, H, L, C, V], ...]"""
-        return self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        return _retry_transient(
+            lambda: self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        )
 
     def fetch_ticker(self, symbol: str) -> dict:
         """Fetch best bid/ask and last price."""
-        return self._exchange.fetch_ticker(symbol)
+        return _retry_transient(
+            lambda: self._exchange.fetch_ticker(symbol)
+        )
 
     def fetch_balance(self) -> dict:
         """Fetch full account balance dict."""
-        return self._exchange.fetch_balance()
+        return _retry_transient(lambda: self._exchange.fetch_balance())
 
     def create_limit_buy(
         self, symbol: str, qty: float, price: float
     ) -> dict:
-        return self._exchange.create_limit_buy_order(symbol, qty, price)
+        return _retry_transient(
+            lambda: self._exchange.create_limit_buy_order(symbol, qty, price)
+        )
 
     def create_limit_sell(
         self, symbol: str, qty: float, price: float
     ) -> dict:
-        return self._exchange.create_limit_sell_order(symbol, qty, price)
+        return _retry_transient(
+            lambda: self._exchange.create_limit_sell_order(symbol, qty, price)
+        )
 
     def fetch_order(self, order_id: str, symbol: str) -> dict:
-        return self._exchange.fetch_order(order_id, symbol)
+        return _retry_transient(
+            lambda: self._exchange.fetch_order(order_id, symbol)
+        )
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
-        return self._exchange.cancel_order(order_id, symbol)
+        return _retry_transient(
+            lambda: self._exchange.cancel_order(order_id, symbol)
+        )
 
     def fetch_open_orders(self, symbol: str) -> list[dict]:
-        return self._exchange.fetch_open_orders(symbol)
+        return _retry_transient(
+            lambda: self._exchange.fetch_open_orders(symbol)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -806,19 +864,22 @@ class TradingBridge:
     ) -> tuple[float, float]:
         """Compute (target_btc, delta_btc) from the current signal.
 
-        Spot-only: signal clamped to [0, 1] (no short selling on spot).
-        target_btc = (clamped_signal * max_usdt) / price
-        delta_btc  = target_btc - btc_held
+        Signal range [-1, 1]:
+          signal > 0  → allocate (signal * max_usdt) to BTC (long)
+          signal <= 0 → target 0 BTC (flat/sell on spot — no shorting)
         """
-        effective_signal = max(min(signal, 1.0), 0.0)
+        effective_signal = max(min(signal, 1.0), -1.0)
 
         if current_price <= 0:
             return 0.0, -btc_held
 
-        target_usdt = effective_signal * max_usdt
-        target_btc = target_usdt / current_price
-        delta_btc = target_btc - btc_held
+        if effective_signal <= 0:
+            target_btc = 0.0
+        else:
+            target_usdt = effective_signal * max_usdt
+            target_btc = target_usdt / current_price
 
+        delta_btc = target_btc - btc_held
         return target_btc, delta_btc
 
     # -- Single cycle -------------------------------------------------------
